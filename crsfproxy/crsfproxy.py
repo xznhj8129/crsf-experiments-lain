@@ -16,7 +16,7 @@ CRSF TX side bridge:
 - Parses inbound CRSF telemetry.
 
 Telemetry output:
-- TCP client: JSON lines (backward compatible).
+- TCP client: JSON lines
 - Optional UDP broadcast: msgpack blobs to --udp_addr:--udp_port containing:
   {"id": my_id, "tele_packets":[{...}, ...], "t": unix_ms, "crc": 0}
 
@@ -242,6 +242,7 @@ def main():
     parser.add_argument('--device', default='/dev/ttyUSB0', required=False, help="Serial device")
     parser.add_argument('--baud', type=int, default=921600, required=False, help="Serial device baudrate") #921600
     parser.add_argument('--tx_rate', type=float, default=100.0, help="RC frame rate Hz")
+    parser.add_argument('--loop_hz', type=float, default=250.0, help="Max main loop rate Hz")
     parser.add_argument('--failsafe_time_ms', type=int, default=1000, help="Enter failsafe after this")
     parser.add_argument('--telebuffer', type=int, default=32, help="Telemetry packets to batch per send")
     parser.add_argument('--udp_broadcast', action='store_true', help="Enable UDP broadcast for telemetry (msgpack)")
@@ -253,6 +254,8 @@ def main():
     HOST = args.host
     PORT = args.port
     tx_rate = float(args.tx_rate)
+    loop_hz = float(args.loop_hz)
+    loop_period = 1.0 / loop_hz
     failsafe_time_ms = int(args.failsafe_time_ms)
     telebuffer = int(args.telebuffer)
 
@@ -261,8 +264,8 @@ def main():
     channels_us[3] = 900   # throttle
     channels_us[4] = 900   # arm
 
-    failsafe_us = channels_us.copy()
-    failsafe_us[3] = 900
+    failsafe_us = channels_us.copy() 
+    failsafe_us[3] = 900 # ARE YOU SURE ABOUT THAT
     failsafe_us[4] = 900
 
     print(f"Listening for connections on {HOST}:{PORT}")
@@ -300,6 +303,7 @@ def main():
 
     try:
         while True:
+            loop_start = time.time()
             now = time.time()
 
             # Accept new client if none connected
@@ -444,6 +448,10 @@ def main():
                 except Exception as e:
                     print(f"Serial write error: {e}")
                 last_tx_t = now
+
+            loop_elapsed = time.time() - loop_start
+            if loop_elapsed < loop_period:
+                time.sleep(loop_period - loop_elapsed)
 
     except KeyboardInterrupt:
         print("Shutdown requested.")
