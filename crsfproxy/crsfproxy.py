@@ -240,7 +240,7 @@ def main():
     parser.add_argument('--host', default='localhost', required=False, help="Socket bind host")
     parser.add_argument('--port', type=int, default=8099, required=False, help="Socket port")
     parser.add_argument('--device', default='/dev/ttyUSB0', required=False, help="Serial device")
-    parser.add_argument('--baud', type=int, default=921600, required=False, help="Serial device baudrate") #921600
+    parser.add_argument('--baud', type=int, default=115200, required=False, help="Serial device baudrate") #921600
     parser.add_argument('--tx_rate', type=float, default=100.0, help="RC frame rate Hz")
     parser.add_argument('--loop_hz', type=float, default=250.0, help="Max main loop rate Hz")
     parser.add_argument('--failsafe_time_ms', type=int, default=1000, help="Enter failsafe after this")

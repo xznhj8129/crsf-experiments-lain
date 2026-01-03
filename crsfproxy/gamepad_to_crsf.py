@@ -75,6 +75,8 @@ def main():
     channels[4] = MIN_US
     armed = False
     last_arm_btn = 0
+    btn_latched = [False] * 4
+    last_btns = [0] * 4
 
     try:
         while True:
@@ -92,7 +94,10 @@ def main():
             channels[4] = MAX_US if armed else MIN_US
 
             for i in range(4):
-                channels[5 + i] = button_to_us(buttons[i])
+                if buttons[i] and not last_btns[i]:
+                    btn_latched[i] = not btn_latched[i]
+                last_btns[i] = buttons[i]
+                channels[5 + i] = MAX_US if btn_latched[i] else MIN_US
 
             payload = {
                 "id": args.id,
