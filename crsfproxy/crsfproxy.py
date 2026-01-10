@@ -1,30 +1,45 @@
 #!/usr/bin/env python3
-import argparse
-import json
-import socket
-import time
-from enum import IntEnum
-
-import msgpack
-import serial
-
 """
+Usage:
+  python crsfproxy.py --device /dev/ttyUSB0 --baud 420000 --host 0.0.0.0 --port 60000 --loop_hz 250 --tx_rate 100 --telemetry_udp 192.168.4.2:40042
+
 CRSF TX side bridge:
-- Listens on a TCP port for JSON lines: {"id":"your_id","ch":[us...], "t":unix_ms}
-  ch is 1..16 PWM in microseconds (988..2012 typical). Missing channels are left unchanged.
+- Listens on a UDP port for 40-byte RC packets: <uint32 t_ms><16 x uint16 us><uint32 crc32>.
 - Converts to CRSF RC_CHANNELS_PACKED and writes to the serial CRSF port at tx_rate.
-- Parses inbound CRSF telemetry.
+- Parses inbound CRSF telemetry and can forward raw frames to a UDP target (e.g. MWP).
 
 Telemetry output:
-- TCP client: JSON lines
-- Optional UDP broadcast: msgpack blobs to --udp_addr:--udp_port containing:
-  {"id": my_id, "tele_packets":[{...}, ...], "t": unix_ms, "crc": 0}
+- Optional raw CRSF frames to --telemetry_udp (host:port)
 
-Failsafe:
-- If no RC update received for failsafe_time_ms, throttle and arm are forced low.
+Failsafe (proxy):
+- If RC updates stop for < failsafe_time_ms, repeat last_valid_channels_us.
+- If RC updates stop for >= failsafe_time_ms, send --failsafe_channels_us (defaults to throttle/arm low).
+- Radio link failsafe (TX<->RX loss) is handled by the receiver, not this proxy.
+- Failsafe channel values are configurable via --failsafe_channels_us.
 """
 
+import argparse
+import socket
+import struct
+import time
+import zlib
+from enum import IntEnum
+
+import serial
+
 CRSF_SYNC = 0xC8
+CHANNEL_COUNT = 16
+MIN_US = 900
+MAX_US = 2100
+ARM_LOW_US = 900
+MID_US = 1500
+UDP_PAYLOAD_LEN = 4 + CHANNEL_COUNT * 2
+UDP_PACKET_LEN = UDP_PAYLOAD_LEN + 4
+WRITE_TIMEOUT_S = 0.1
+FAILSAFE_DEFAULT_US = [
+    1500, 1500, 900, 1500, 900, 1500, 1500, 1500,
+    1500, 1500, 1500, 1500, 1500, 1500, 1500, 1500,
+]
 
 class PacketsTypes(IntEnum):
     GPS = 0x02
@@ -77,7 +92,7 @@ def crsf_to_us(v: int) -> int:
 
 def packCrsfToBytes(channels) -> bytes:
     # channels are 16 ints in CRSF range (0..1811, typical 172..1811)
-    if len(channels) != 16:
+    if len(channels) != CHANNEL_COUNT:
         raise ValueError("CRSF must have 16 channels")
     result = bytearray()
     destShift = 0
@@ -105,7 +120,7 @@ def channelsCrsfToChannelsPacket(channels_crsf) -> bytes:
 
 def channelsUsToPacket(us_channels) -> bytes:
     # us_channels: list of 16 microsecond values
-    if len(us_channels) != 16:
+    if len(us_channels) != CHANNEL_COUNT:
         raise ValueError("Need 16 channels")
     crsf_ch = [us_to_crsf(v) for v in us_channels]
     return channelsCrsfToChannelsPacket(crsf_ch)
@@ -122,13 +137,13 @@ def unpack_rc_channels(payload: bytes) -> list:
             ch.append(acc & 0x7FF)
             acc >>= 11
             bits -= 11
-            if len(ch) == 16:
+            if len(ch) == CHANNEL_COUNT:
                 break
-    if len(ch) != 16:
-        ch += [172] * (16 - len(ch))
+    if len(ch) != CHANNEL_COUNT:
+        ch += [172] * (CHANNEL_COUNT - len(ch))
     return ch
 
-def handleCrsfPacket(ptype: int, data: bytes):
+def handleCrsfPacket(ptype: int, data: bytes, verbose=False):
     """
     Parse CRSF telemetry packet. Returns a dict, or None if unhandled.
     data is the whole frame, including sync and crc.
@@ -172,9 +187,22 @@ def handleCrsfPacket(ptype: int, data: bytes):
         return out
 
     if pkt_type == PacketsTypes.FLIGHT_MODE:
+        raw_mode = bytes(data[3:-1]).decode("ascii", errors="ignore")
+        clean = []
+        for ch in raw_mode:
+            if ch == "\x00":
+                break
+            if ch in ("*", " "):
+                break
+            if ch.isalpha() or ch.isdigit() or ch in ("!", "_"):
+                clean.append(ch)
+            else:
+                break
+        mode = "".join(clean)
         out.update({
             "type": "FLIGHT_MODE",
-            "mode": bytes(data[3:-1]).decode("ascii", errors="ignore").rstrip("\x00")
+            "mode": mode,
+            "raw_mode": raw_mode
         })
         return out
 
@@ -232,154 +260,111 @@ def handleCrsfPacket(ptype: int, data: bytes):
         return out
 
     out.update({"type": "UNKNOWN", "raw": data.hex()})
+    if verbose:
+        print(f"Telemetry UNKNOWN type=0x{ptype:02x} raw={data.hex()}")
     return out
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--id', default='tx1', required=False, help="My ID")
-    parser.add_argument('--host', default='localhost', required=False, help="Socket bind host")
-    parser.add_argument('--port', type=int, default=8099, required=False, help="Socket port")
+    parser.add_argument('--host', default='0.0.0.0', required=False, help="UDP bind host for RC packets")
+    parser.add_argument('--port', type=int, default=60000, required=False, help="UDP port for RC packets")
     parser.add_argument('--device', default='/dev/ttyUSB0', required=False, help="Serial device")
     parser.add_argument('--baud', type=int, default=115200, required=False, help="Serial device baudrate") #921600
     parser.add_argument('--tx_rate', type=float, default=100.0, help="RC frame rate Hz")
     parser.add_argument('--loop_hz', type=float, default=250.0, help="Max main loop rate Hz")
     parser.add_argument('--failsafe_time_ms', type=int, default=1000, help="Enter failsafe after this")
-    parser.add_argument('--telebuffer', type=int, default=32, help="Telemetry packets to batch per send")
-    parser.add_argument('--udp_broadcast', action='store_true', help="Enable UDP broadcast for telemetry (msgpack)")
-    parser.add_argument('--udp_addr', default='255.255.255.255', help="UDP broadcast address")
-    parser.add_argument('--udp_port', type=int, default=8098, help="UDP broadcast port")
+    parser.add_argument('--failsafe_channels_us', nargs=CHANNEL_COUNT, type=int, default=FAILSAFE_DEFAULT_US, help="Failsafe channels in microseconds (16 values, space-separated)")
+    parser.add_argument('--telemetry_udp', help="Send raw CRSF telemetry frames to udp://host:port (e.g. MWP)")
+    parser.add_argument('--debug', action='store_true', help="Verbose RC/telemetry logging")
     args = parser.parse_args()
 
-    my_id = args.id
     HOST = args.host
     PORT = args.port
     tx_rate = float(args.tx_rate)
     loop_hz = float(args.loop_hz)
     loop_period = 1.0 / loop_hz
     failsafe_time_ms = int(args.failsafe_time_ms)
-    telebuffer = int(args.telebuffer)
 
     # RC channel state (microseconds). Initialize throttle and arm low.
-    channels_us = [1500] * 16
-    channels_us[3] = 900   # throttle
-    channels_us[4] = 900   # arm
+    channels_us = [MID_US] * CHANNEL_COUNT
+    channels_us[2] = MIN_US   # throttle
+    channels_us[4] = ARM_LOW_US   # arm
 
-    failsafe_us = channels_us.copy() 
-    failsafe_us[3] = 900 # ARE YOU SURE ABOUT THAT
-    failsafe_us[4] = 900
+    failsafe_us = list(args.failsafe_channels_us)
 
-    print(f"Listening for connections on {HOST}:{PORT}")
+    print(f"Listening for UDP RC on {HOST}:{PORT}")
 
     # Open serial nonblocking-ish
-    ser = serial.Serial(args.device, args.baud, timeout=0)
+    ser = serial.Serial(args.device, args.baud, timeout=0, write_timeout=WRITE_TIMEOUT_S)
     input_buf = bytearray()
 
-    # Server socket
-    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind((HOST, PORT))
-    srv.listen()
-    srv.settimeout(0.1)
+    # UDP socket for RC input
+    rc_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    rc_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    rc_sock.bind((HOST, PORT))
+    rc_sock.setblocking(False)
 
-    # Optional UDP broadcast socket for telemetry (msgpack)
-    udp_sock = None
-    udp_target = None
-    if args.udp_broadcast:
-        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        udp_sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        udp_sock.setblocking(False)
-        udp_target = (args.udp_addr, args.udp_port)
-        print(f"UDP telemetry broadcast enabled to {udp_target}")
+    # Optional UDP socket for telemetry (raw CRSF frames)
+    tele_sock = None
+    tele_target = None
+    if args.telemetry_udp is not None:
+        if ":" not in args.telemetry_udp:
+            raise ValueError("telemetry_udp must be host:port")
+        host, port_s = args.telemetry_udp.rsplit(":", 1)
+        tele_target = (host, int(port_s))
+        tele_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        tele_sock.setblocking(False)
+        print(f"Telemetry UDP target {tele_target}")
+        if args.debug:
+            print("Debug telemetry forwarding enabled")
 
-    conn = None
-    addr = None
-    net_rx_buf = ""  # text buffer for newline-delimited JSON
+    last_rc_sender = None
     last_rc_update_t = 0.0
     last_tx_t = 0.0
-    last_tele_send_t = 0.0
-    tele_packets = []
-
-    ACK = b"\x06"  # single byte ack
+    last_valid_channels_us = None
 
     try:
         while True:
             loop_start = time.time()
             now = time.time()
 
-            # Accept new client if none connected
-            if conn is None:
+            # Read RC updates from UDP (drain socket, keep latest)
+            while True:
                 try:
-                    conn, addr = srv.accept()
-                    conn.setblocking(False)
-                    print(f"Connected by {addr}")
-                    net_rx_buf = ""
-                except socket.timeout:
-                    pass
-                except BlockingIOError:
-                    pass
-
-            # Read from net
-            if conn is not None:
-                try:
-                    data = conn.recv(4096)
-                    if data:
-                        net_rx_buf += data.decode("utf-8", errors="ignore")
-                        # process complete JSON lines
-                        while '\n' in net_rx_buf:
-                            line, net_rx_buf = net_rx_buf.split('\n', 1)
-                            line = line.strip()
-                            if not line:
-                                continue
-                            try:
-                                cmd = json.loads(line)
-                                # Expect {"id":"..","ch":[...],"t":...}
-                                if "ch" in cmd:
-                                    arr = cmd["ch"]
-                                    if not isinstance(arr, list):
-                                        raise ValueError("ch must be a list")
-                                    # Update channels; allow short arrays to patch leading channels
-                                    for i, v in enumerate(arr):
-                                        if i >= 16:
-                                            break
-                                        if v is None:
-                                            continue
-                                        channels_us[i] = int(v)
-                                    last_rc_update_t = now
-                                # respond ack for each message
-                                try:
-                                    conn.sendall(ACK)
-                                except BrokenPipeError:
-                                    pass
-                            except Exception as e:
-                                print(f"Bad JSON from client: {e}")
-                    else:
-                        # client closed
-                        print("Connection closed by client.")
-                        conn.close()
-                        conn = None
-                        addr = None
+                    data, sender = rc_sock.recvfrom(128)
                 except (BlockingIOError, InterruptedError):
-                    pass
-                except ConnectionResetError:
-                    print("Connection reset.")
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-                    conn = None
-                    addr = None
+                    break
+                if len(data) != UDP_PACKET_LEN:
+                    print(f"Bad RC packet length {len(data)} from {sender}")
+                    continue
+                payload = data[:UDP_PAYLOAD_LEN]
+                crc_rx = struct.unpack_from("<I", data, UDP_PAYLOAD_LEN)[0]
+                crc_calc = zlib.crc32(payload) & 0xFFFFFFFF
+                if crc_calc != crc_rx:
+                    print(f"CRC mismatch from {sender}: got {crc_rx:08x} expected {crc_calc:08x}")
+                    continue
+                _ts_ms = struct.unpack_from("<I", payload, 0)[0]
+                ch = list(struct.unpack_from("<16H", payload, 4))
+                if sender != last_rc_sender:
+                    print(f"Receiving RC from {sender}")
+                channels_us = ch
+                last_valid_channels_us = ch
+                last_rc_update_t = now
+                last_rc_sender = sender
 
             # Read from serial
             try:
                 waiting = ser.in_waiting
             except OSError:
                 waiting = 0
-            if waiting and waiting > 0:
+            if waiting > 0:
                 chunk = ser.read(waiting)
                 if chunk.startswith(b"$X"):
                     # Some devices prepend 8 bytes of junk
                     chunk = chunk[8:]
                 input_buf.extend(chunk)
+                #if args.debug:
+                #    print(f"Serial read {len(chunk)} bytes (buffer {len(input_buf)})")
 
             # Parse CRSF frames from buffer
             while len(input_buf) > 2:
@@ -395,58 +380,51 @@ def main():
                 if not crsf_validate_frame(frame):
                     print("crc error:", frame.hex())
                     continue
-                pkt = handleCrsfPacket(frame[2], frame)
-                if pkt is not None:
-                    tele_packets.append(pkt)
-
-            # Periodically send batched telemetry
-            should_flush = tele_packets and (
-                len(tele_packets) >= telebuffer or (now - last_tele_send_t) >= 0.1
-            )
-            if should_flush:
-                out = {
-                    "id": my_id,
-                    "tele_packets": tele_packets[:telebuffer],
-                    "t": int(now * 1000),
-                    "crc": 0,
-                }
-
-                # TCP client: JSON lines
-                if conn is not None:
+                if tele_sock is not None:
                     try:
-                        conn.sendall((json.dumps(out) + "\n").encode("utf-8"))
-                    except (BrokenPipeError, ConnectionResetError):
-                        print("Connection lost while sending telemetry.")
-                        try:
-                            conn.close()
-                        except Exception:
-                            pass
-                        conn = None
-                        addr = None
-
-                # UDP broadcast: msgpack
-                if udp_sock is not None:
-                    try:
-                        payload = msgpack.packb(out, use_bin_type=True)
-                        udp_sock.sendto(payload, udp_target)
-                    except Exception as e:
-                        print(f"UDP send error: {e}")
-
-                # drop sent items
-                tele_packets = tele_packets[telebuffer:]
-                last_tele_send_t = now
+                        tele_sock.sendto(frame, tele_target)
+                        if args.debug:
+                            print(f"Sent telemetry frame len={len(frame)} type=0x{frame[2]:02x} to {tele_target}")
+                    except BlockingIOError:
+                        pass
+                pkt = handleCrsfPacket(frame[2], frame, verbose=args.debug)
+                if args.debug and pkt is not None:
+                    ptype = pkt.get("type")
+                    if ptype == "LINK_STATISTICS":
+                        print(f"TEL LINK rssi1={pkt['rssi1']} rssi2={pkt['rssi2']} lq={pkt['lq']} snr={pkt['snr']} pwr={pkt['power']} down_rssi={pkt['downlink_rssi']} down_lq={pkt['downlink_lq']} down_snr={pkt['downlink_snr']}")
+                    elif ptype == "ATTITUDE":
+                        print(f"TEL ATTI p={pkt['pitch_rad']:.3f} r={pkt['roll_rad']:.3f} y={pkt['yaw_rad']:.3f}")
+                    elif ptype == "FLIGHT_MODE":
+                        print(f"TEL MODE {pkt['mode']} raw='{pkt.get('raw_mode','')}'")
+                    elif ptype == "BATTERY_SENSOR":
+                        print(f"TEL BATT {pkt['vbat_v']:.1f}V {pkt['current_a']:.1f}A {pkt['mah']}mAh {pkt['pct']}%")
+                    elif ptype == "GPS":
+                        print(f"TEL GPS lat={pkt['lat']:.6f} lon={pkt['lon']:.6f} alt={pkt['alt_m']}m gspd={pkt['gspd_ms']:.2f}m/s hdg={pkt['hdg_deg']:.2f} sats={pkt['sats']}")
+                    elif ptype == "VARIO":
+                        print(f"TEL VARIO vspd={pkt['vspd_ms']:.1f}m/s")
+                    elif ptype == "BARO_ALT":
+                        print(f"TEL BARO alt={pkt['alt_m']:.2f}m")
+                    elif ptype == "RC_CHANNELS_PACKED":
+                        print(f"TEL RC ch0-3={pkt['ch_us'][:4]} ch4-7={pkt['ch_us'][4:8]}")
+                    #elif ptype == "RADIO_ID": # skip printing
+                    #    print(f"TEL RADIO_ID {pkt['raw']}")
+                    elif ptype == "DEVICE_INFO":
+                        print(f"TEL DEVICE_INFO {pkt['raw']}")
 
             # Determine which channels to send
             if (now - last_tx_t) >= (1.0 / tx_rate):
                 elapsed_ms = (now - last_rc_update_t) * 1000.0
-                if last_rc_update_t == 0.0 or elapsed_ms >= failsafe_time_ms:
+                if last_valid_channels_us is None:
+                    active = failsafe_us
+                elif elapsed_ms >= failsafe_time_ms:
                     active = failsafe_us
                 else:
-                    active = channels_us
+                    active = last_valid_channels_us
                 try:
-                    ser.write(channelsUsToPacket(active))
-                except Exception as e:
-                    print(f"Serial write error: {e}")
+                    frame = channelsUsToPacket(active)
+                    ser.write(frame)
+                except serial.SerialTimeoutException as e:
+                    print(f"Serial write timeout port={args.device} baud={args.baud} frame_len={len(frame)} elapsed_ms={elapsed_ms:.1f} err={e}")
                 last_tx_t = now
 
             loop_elapsed = time.time() - loop_start
@@ -457,21 +435,16 @@ def main():
         print("Shutdown requested.")
     finally:
         try:
-            if conn is not None:
-                conn.close()
-        except Exception:
-            pass
-        try:
-            srv.close()
+            rc_sock.close()
         except Exception:
             pass
         try:
             ser.close()
         except Exception:
             pass
-        if udp_sock is not None:
+        if tele_sock is not None:
             try:
-                udp_sock.close()
+                tele_sock.close()
             except Exception:
                 pass
 
