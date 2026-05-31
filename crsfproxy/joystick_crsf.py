@@ -21,6 +21,8 @@ DEFAULT_PORT = 60000
 DEFAULT_RATE_HZ = 50.0
 AXIS_COUNT = 4
 BUTTON_COUNT = 12
+GAMEPAD_AUX_BUTTON_COUNT = 8
+GAMEPAD_LATCHED_BUTTON_COUNT = 4
 
 
 def axis_to_us(value: float) -> int:
@@ -80,8 +82,8 @@ def main():
     channels[4] = MIN_US
     armed = False
     last_arm_btn = 0
-    btn_latched = [False] * 4
-    last_btns = [0] * 4
+    btn_latched = [False] * GAMEPAD_AUX_BUTTON_COUNT
+    last_btns = [0] * GAMEPAD_AUX_BUTTON_COUNT
 
     dbg_t = 0.0
     try:
@@ -110,15 +112,16 @@ def main():
                 last_arm_btn = arm_btn
                 channels[4] = MAX_US if armed else MIN_US
 
-                for i in range(4):
-                    if buttons[i] and not last_btns[i]:
+                for i in range(GAMEPAD_AUX_BUTTON_COUNT):
+                    if i < GAMEPAD_LATCHED_BUTTON_COUNT and buttons[i] and not last_btns[i]:
                         btn_latched[i] = not btn_latched[i]
                     last_btns[i] = buttons[i]
-                    channels[5 + i] = MAX_US if btn_latched[i] else MIN_US
+                    channels[5 + i] = MAX_US if (buttons[i] if i >= GAMEPAD_LATCHED_BUTTON_COUNT else btn_latched[i]) else MIN_US
+
             if args.debugch:
                 now = time.time()
                 if now - dbg_t >= 0.5:  # ~2 Hz
-                    print(channels)
+                    print(f"buttons={buttons} channels={channels}")
                     dbg_t = now
             payload = struct.pack("<I16H", int(time.time() * 1000) & 0xFFFFFFFF, *channels)
             crc = zlib.crc32(payload) & 0xFFFFFFFF
