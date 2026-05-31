@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Usage:
-  python crsfproxy.py --device /dev/ttyUSB0 --baud 420000 --host 0.0.0.0 --port 60000 --loop_hz 250 --tx_rate 100 --telemetry_udp 192.168.4.2:40042
+  python crsfproxy.py --device /dev/ttyUSB0 --baud 115200 --host 0.0.0.0 --port 60000 --loop_hz 250 --tx_rate 100 --telemetry_udp 192.168.4.2:40042
 
 CRSF TX side bridge:
 - Listens on a UDP port for 40-byte RC packets: <uint32 t_ms><16 x uint16 us><uint32 crc32>.
@@ -28,6 +28,7 @@ from enum import IntEnum
 import serial
 
 CRSF_SYNC = 0xC8
+CRSF_TRANSMITTER = 0xEE
 CHANNEL_COUNT = 16
 MIN_US = 900
 MAX_US = 2100
@@ -36,6 +37,9 @@ MID_US = 1500
 UDP_PAYLOAD_LEN = 4 + CHANNEL_COUNT * 2
 UDP_PACKET_LEN = UDP_PAYLOAD_LEN + 4
 WRITE_TIMEOUT_S = 0.1
+SERIAL_PREVIEW_LEN = 24
+DEFAULT_BAUD = 115200
+SERIAL_RX_HEADERS = (CRSF_SYNC, CRSF_TRANSMITTER)
 FAILSAFE_DEFAULT_US = [
     1500, 1500, 900, 1500, 900, 1500, 1500, 1500,
     1500, 1500, 1500, 1500, 1500, 1500, 1500, 1500,
@@ -269,7 +273,7 @@ def main():
     parser.add_argument('--host', default='0.0.0.0', required=False, help="UDP bind host for RC packets")
     parser.add_argument('--port', type=int, default=60000, required=False, help="UDP port for RC packets")
     parser.add_argument('--device', default='/dev/ttyUSB0', required=False, help="Serial device")
-    parser.add_argument('--baud', type=int, default=115200, required=False, help="Serial device baudrate") #921600
+    parser.add_argument('--baud', type=int, default=DEFAULT_BAUD, required=False, help="Serial device baudrate")
     parser.add_argument('--tx_rate', type=float, default=100.0, help="RC frame rate Hz")
     parser.add_argument('--loop_hz', type=float, default=250.0, help="Max main loop rate Hz")
     parser.add_argument('--failsafe_time_ms', type=int, default=1000, help="Enter failsafe after this")
@@ -294,8 +298,33 @@ def main():
 
     print(f"Listening for UDP RC on {HOST}:{PORT}")
 
-    # Open serial nonblocking-ish
-    ser = serial.Serial(args.device, args.baud, timeout=0, write_timeout=WRITE_TIMEOUT_S)
+    # Open serial without asserting modem control lines during startup.
+    ser = serial.Serial()
+    ser.port = args.device
+    ser.baudrate = args.baud
+    ser.timeout = 0
+    ser.write_timeout = WRITE_TIMEOUT_S
+    ser.bytesize = serial.EIGHTBITS
+    ser.parity = serial.PARITY_NONE
+    ser.stopbits = serial.STOPBITS_ONE
+    ser.xonxoff = False
+    ser.rtscts = False
+    ser.dsrdtr = False
+    ser.rts = False
+    ser.dtr = False
+    ser.open()
+    ser.reset_input_buffer()
+    ser.reset_output_buffer()
+    if args.debug:
+        print(
+            f"Opened serial device={args.device} "
+            f"baud_request={args.baud} "
+            f"baud_open={ser.baudrate} "
+            f"timeout={ser.timeout} "
+            f"write_timeout={ser.write_timeout} "
+            f"rts={ser.rts} "
+            f"dtr={ser.dtr}"
+        )
     input_buf = bytearray()
 
     # UDP socket for RC input
@@ -322,6 +351,8 @@ def main():
     last_rc_update_t = 0.0
     last_tx_t = 0.0
     last_valid_channels_us = None
+    last_control_state = None
+    last_tx_debug_t = 0.0
 
     try:
         while True:
@@ -345,8 +376,8 @@ def main():
                     continue
                 _ts_ms = struct.unpack_from("<I", payload, 0)[0]
                 ch = list(struct.unpack_from("<16H", payload, 4))
-                if sender != last_rc_sender:
-                    print(f"Receiving RC from {sender}")
+                if args.debug and sender != last_rc_sender:
+                    print(f"Receiving RC from {sender} ch0-3={ch[:4]} ch4-7={ch[4:8]}")
                 channels_us = ch
                 last_valid_channels_us = ch
                 last_rc_update_t = now
@@ -355,31 +386,83 @@ def main():
             # Read from serial
             try:
                 waiting = ser.in_waiting
-            except OSError:
-                waiting = 0
+            except OSError as e:
+                print(f"Serial in_waiting failed port={args.device} baud={args.baud} err={e}")
+                raise
             if waiting > 0:
-                chunk = ser.read(waiting)
+                try:
+                    chunk = ser.read(waiting)
+                except OSError as e:
+                    print(f"Serial read failed port={args.device} baud={args.baud} waiting={waiting} err={e}")
+                    raise
                 if chunk.startswith(b"$X"):
                     # Some devices prepend 8 bytes of junk
                     chunk = chunk[8:]
                 input_buf.extend(chunk)
-                #if args.debug:
-                #    print(f"Serial read {len(chunk)} bytes (buffer {len(input_buf)})")
+                if args.debug and len(chunk) > 0:
+                    print(
+                        f"Serial rx chunk_len={len(chunk)} "
+                        f"buffer_len={len(input_buf)} "
+                        f"chunk_hex={chunk[:SERIAL_PREVIEW_LEN].hex()}"
+                    )
 
             # Parse CRSF frames from buffer
             while len(input_buf) > 2:
+                if input_buf[0] not in SERIAL_RX_HEADERS:
+                    sync_index = -1
+                    for header_byte in SERIAL_RX_HEADERS:
+                        header_index = input_buf.find(bytes((header_byte,)))
+                        if header_index != -1 and (sync_index == -1 or header_index < sync_index):
+                            sync_index = header_index
+                    if sync_index == -1:
+                        if args.debug:
+                            print(
+                                f"Serial discard reason=no_sync "
+                                f"discard_len={len(input_buf)} "
+                                f"discard_hex={bytes(input_buf[:SERIAL_PREVIEW_LEN]).hex()}"
+                            )
+                        input_buf.clear()
+                        break
+                    if args.debug and sync_index > 0:
+                        print(
+                            f"Serial discard reason=resync "
+                            f"discard_len={sync_index} "
+                            f"discard_hex={bytes(input_buf[:sync_index])[:SERIAL_PREVIEW_LEN].hex()}"
+                        )
+                    del input_buf[:sync_index]
+                    if len(input_buf) <= 2:
+                        break
                 expected_len = input_buf[1] + 2  # length includes type..crc, plus sync+len here
                 if expected_len > 64 or expected_len < 4:
-                    # Malformed, flush
-                    input_buf = bytearray()
-                    break
+                    if args.debug:
+                        print(
+                            f"Serial discard reason=bad_len "
+                            f"len_byte={input_buf[1]} "
+                            f"buffer_len={len(input_buf)} "
+                            f"buffer_hex={bytes(input_buf[:SERIAL_PREVIEW_LEN]).hex()}"
+                        )
+                    del input_buf[0]
+                    continue
                 if len(input_buf) < expected_len:
                     break
                 frame = bytes(input_buf[:expected_len])
                 del input_buf[:expected_len]
                 if not crsf_validate_frame(frame):
-                    print("crc error:", frame.hex())
+                    if args.debug:
+                        print(
+                            f"Serial discard reason=crc_error "
+                            f"frame_len={len(frame)} "
+                            f"type=0x{frame[2]:02x} "
+                            f"frame_hex={frame.hex()}"
+                        )
                     continue
+                if args.debug:
+                    print(
+                        f"Serial frame_header=0x{frame[0]:02x} "
+                        f"Serial frame_ok len={len(frame)} "
+                        f"type=0x{frame[2]:02x} "
+                        f"frame_hex={frame[:SERIAL_PREVIEW_LEN].hex()}"
+                    )
                 if tele_sock is not None:
                     try:
                         tele_sock.sendto(frame, tele_target)
@@ -416,10 +499,30 @@ def main():
                 elapsed_ms = (now - last_rc_update_t) * 1000.0
                 if last_valid_channels_us is None:
                     active = failsafe_us
+                    control_state = "no_rc"
                 elif elapsed_ms >= failsafe_time_ms:
                     active = failsafe_us
+                    control_state = "failsafe"
                 else:
                     active = last_valid_channels_us
+                    control_state = "live_rc"
+                if args.debug and control_state != last_control_state:
+                    print(
+                        f"RC state={control_state} "
+                        f"sender={last_rc_sender} "
+                        f"elapsed_ms={elapsed_ms:.1f} "
+                        f"ch0-3={active[:4]} "
+                        f"ch4-7={active[4:8]}"
+                    )
+                    last_control_state = control_state
+                if args.debug and (now - last_tx_debug_t) >= 0.5:
+                    print(
+                        f"Serial tx state={control_state} "
+                        f"elapsed_ms={elapsed_ms:.1f} "
+                        f"ch0-3={active[:4]} "
+                        f"ch4-7={active[4:8]}"
+                    )
+                    last_tx_debug_t = now
                 try:
                     frame = channelsUsToPacket(active)
                     ser.write(frame)
@@ -436,16 +539,16 @@ def main():
     finally:
         try:
             rc_sock.close()
-        except Exception:
+        except OSError:
             pass
         try:
             ser.close()
-        except Exception:
+        except OSError:
             pass
         if tele_sock is not None:
             try:
                 tele_sock.close()
-            except Exception:
+            except OSError:
                 pass
 
 if __name__ == "__main__":
