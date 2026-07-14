@@ -3,6 +3,7 @@
 
   python3 elrstest.py identify                 # which port is what
   python3 elrstest.py smoke                    # plug in, see what works
+  python3 elrstest.py rf-sweep                 # sweep packet rates and RF bands
   python3 elrstest.py rx monitor               # live CRSF decode from the receiver
   python3 elrstest.py rx devices               # DEVICE_PING over the RX UART
   python3 elrstest.py rx params                # full Lua parameter dump
@@ -37,6 +38,7 @@ from elrstest.link import (
     sniff_crsf,
 )
 from elrstest.smoke import run_smoke
+from elrstest.sweep import run_rf_sweep
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "elrstest.ini"
 
@@ -169,6 +171,7 @@ def main() -> int:
 
     sub.add_parser("identify", help="sniff each USB serial port and say what it is")
     sub.add_parser("smoke", help="run every check the current wiring allows")
+    sub.add_parser("rf-sweep", help="sweep every advertised packet rate and RF band")
 
     for endpoint in ("rx", "tx"):
         ep = sub.add_parser(endpoint, help=f"talk to the {endpoint.upper()} endpoint")
@@ -200,6 +203,9 @@ def main() -> int:
         return cmd_identify(config)
     if args.command == "smoke":
         report = run_smoke(config)
+        return 2 if report.failed else 0
+    if args.command == "rf-sweep":
+        report = run_rf_sweep(config)
         return 2 if report.failed else 0
     if args.command == "tx" and args.action == "probe":
         result = flash_probe(args.device or config.tx_flash_port)

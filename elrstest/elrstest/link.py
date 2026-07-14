@@ -19,6 +19,7 @@ from __future__ import annotations
 import time
 from collections import deque
 from dataclasses import dataclass
+from pathlib import Path
 
 import serial
 
@@ -35,6 +36,7 @@ from .crsf import (
     Parameter,
     ParameterType,
     decode_parameter,
+    describe_frame,
     encode_parameter_value,
     make_battery_frame,
     make_extended_frame,
@@ -46,6 +48,14 @@ RADIO_ID_SYNC_SUBTYPE = 0x10
 CRSF_TICKS_PER_SECOND = 10_000_000  # RADIO_ID durations are 0.1 us ticks
 
 
+def expected_rx_rc_rate_hz(radio_id_rate_hz: float, telemetry_ratio: str) -> float:
+    """RC frames left after fixed-ratio RX telemetry consumes RF slots."""
+    if telemetry_ratio == "Off":
+        return radio_id_rate_hz
+    denominator = int(telemetry_ratio.split(":", 1)[1])
+    return radio_id_rate_hz * (denominator - 1) / denominator
+
+
 class SerialPort:
     """CRSF framing over one serial port.
 
@@ -54,10 +64,14 @@ class SerialPort:
     chip in reset.
     """
 
-    def __init__(self, device: str, baud: int) -> None:
+    def __init__(self, device: str, baud: int, traffic_log: Path | None = None) -> None:
         self.device = device
         self.baud = baud
         self.parser = FrameParser()
+        self.write_parser = FrameParser()
+        self.traffic_log_path = traffic_log
+        self.traffic_log = None
+        self.traffic_started = 0.0
         self.bytes_read = 0
         self.bytes_written = 0
         self.serial = serial.Serial()
@@ -72,9 +86,15 @@ class SerialPort:
         self.serial.open()
         self.serial.reset_input_buffer()
         self.serial.reset_output_buffer()
+        if self.traffic_log_path:
+            self.traffic_log = self.traffic_log_path.open("a", encoding="utf-8", buffering=1)
+            self.traffic_started = time.monotonic()
 
     def close(self) -> None:
         self.serial.close()
+        if self.traffic_log:
+            self.traffic_log.close()
+            self.traffic_log = None
 
     def read_frames(self) -> list[Frame]:
         waiting = self.serial.in_waiting
@@ -82,11 +102,22 @@ class SerialPort:
             return []
         data = self.serial.read(waiting)
         self.bytes_read += len(data)
-        return self.parser.feed(data)
+        frames = self.parser.feed(data)
+        if self.traffic_log:
+            for frame in frames:
+                elapsed = time.monotonic() - self.traffic_started
+                print(f"{elapsed:10.6f} PORT->HOST {describe_frame(frame)} raw={frame.raw.hex()}",
+                      file=self.traffic_log, flush=True)
+        return frames
 
     def write(self, data: bytes) -> None:
         self.serial.write(data)
         self.bytes_written += len(data)
+        if self.traffic_log:
+            for frame in self.write_parser.feed(data):
+                elapsed = time.monotonic() - self.traffic_started
+                print(f"{elapsed:10.6f} HOST->PORT {describe_frame(frame)} raw={frame.raw.hex()}",
+                      file=self.traffic_log, flush=True)
 
     def __enter__(self) -> SerialPort:
         self.open()
@@ -122,6 +153,9 @@ class RxLink:
     def queue(self, frame: bytes) -> None:
         self.port.write(frame)
 
+    def flush(self) -> None:
+        pass
+
     def poll(self) -> list[Frame]:
         return self.port.read_frames()
 
@@ -140,6 +174,7 @@ class HandsetSession:
         self.port = port
         self.channels_us = channels_us or [1500, 1500, 1500, 1500, 1000] + [1500] * 11
         self.interval = initial_interval_s
+        self.shift = 0.0
         self.sync_count = 0
         self.rc_frames_sent = 0
         self.pending: list[bytes] = []
@@ -158,6 +193,11 @@ class HandsetSession:
     def queue(self, frame: bytes) -> None:
         self.pending.append(frame)
 
+    def flush(self) -> None:
+        while self.pending:
+            self.poll()
+            time.sleep(0.001)
+
     def _is_echo(self, frame: Frame) -> bool:
         now = time.monotonic()
         for stamp, raw in self.recent_sent:
@@ -175,11 +215,10 @@ class HandsetSession:
             self.pending.clear()
             self.port.write(burst)
             self.rc_frames_sent += 1
-            for raw in sent_frames:
-                self.recent_sent.append((now, raw))
-            self.next_write += self.interval
-            if self.next_write <= now:
-                self.next_write = now + self.interval
+            for frame in sent_frames:
+                self.recent_sent.append((now, frame))
+            self.next_write = time.monotonic() + self.interval + self.shift
+            self.shift = 0.0
 
         frames = []
         for frame in self.port.read_frames():
@@ -189,7 +228,7 @@ class HandsetSession:
                 shift = int.from_bytes(frame.payload[7:11], "big", signed=True)
                 if interval > 0:
                     self.interval = interval / CRSF_TICKS_PER_SECOND
-                    self.next_write = time.monotonic() + self.interval + shift / CRSF_TICKS_PER_SECOND
+                    self.shift = shift / CRSF_TICKS_PER_SECOND
                 self.sync_count += 1
             if self._is_echo(frame):
                 continue
@@ -257,23 +296,31 @@ class ParameterClient:
                      query_type: int, query_value: int | None = None) -> bytes:
         origin = self.transport.origin(device_address)
         chunk = 0
+        remaining = None
         assembled = bytearray()
         while True:
             value = chunk if query_value is None else query_value
-            self.transport.queue(make_extended_frame(query_type, device_address, origin,
-                                                     bytes([parameter_id, value])))
-            frame = self._pump(
-                time.monotonic() + self.timeout_seconds,
-                lambda f: f.type == FrameType.PARAMETER_SETTINGS_ENTRY
-                and f.origin == device_address and f.extended_payload[0] == parameter_id,
-            )
+            deadline = time.monotonic() + self.timeout_seconds
+            frame = None
+            attempts = 0
+            while frame is None and time.monotonic() < deadline:
+                attempts += 1
+                self.transport.queue(make_extended_frame(
+                    query_type, device_address, origin, bytes([parameter_id, value])))
+                frame = self._pump(
+                    min(deadline, time.monotonic() + 0.5),
+                    lambda f: f.type == FrameType.PARAMETER_SETTINGS_ENTRY
+                    and f.origin == device_address and f.extended_payload[0] == parameter_id
+                    and (remaining is None or f.extended_payload[1] == remaining - 1),
+                )
             if frame is None:
                 raise TimeoutError(
                     f"device=0x{device_address:02X} parameter_id={parameter_id} "
-                    f"chunk={chunk} timeout_seconds={self.timeout_seconds}")
+                    f"chunk={chunk} attempts={attempts} timeout_seconds={self.timeout_seconds}")
             response = frame.extended_payload
             assembled.extend(response[2:])
-            if response[1] == 0:
+            remaining = response[1]
+            if remaining == 0:
                 return bytes(assembled)
             chunk += 1
 
@@ -297,14 +344,26 @@ class ParameterClient:
     def write(self, device_address: int, parameter: Parameter, value: str) -> WriteResult:
         encoded = encode_parameter_value(parameter, value)
         origin = self.transport.origin(device_address)
-        self.transport.queue(make_extended_frame(FrameType.PARAMETER_WRITE, device_address, origin,
-                                                 bytes([parameter.id]) + encoded))
-        deadline = time.monotonic() + 0.4
-        while time.monotonic() < deadline:
-            self.transport.poll()
-            time.sleep(0.002)
-        updated = self.read(device_address, parameter.id)
-        return WriteResult(updated, parameter.value, current_value_bytes(updated) == encoded)
+        write_frame = make_extended_frame(FrameType.PARAMETER_WRITE, device_address, origin,
+                                          bytes([parameter.id]) + encoded)
+        updated = parameter
+        for _ in range(3):
+            self.transport.queue(write_frame)
+            self.transport.flush()
+            self._pump(
+                time.monotonic() + 0.1,
+                lambda f: f.type == FrameType.PARAMETER_WRITE
+                and f.origin == device_address and f.extended_payload[0] == parameter.id
+                and f.extended_payload[1:] == encoded,
+            )
+            time.sleep(0.5)
+            try:
+                updated = self.read(device_address, parameter.id)
+            except TimeoutError:
+                continue
+            if current_value_bytes(updated) == encoded:
+                return WriteResult(updated, parameter.value, True)
+        return WriteResult(updated, parameter.value, False)
 
     def command(self, device_address: int, parameter: Parameter, confirm: bool = False) -> Parameter:
         if parameter.type != ParameterType.COMMAND:

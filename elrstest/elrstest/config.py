@@ -17,6 +17,12 @@ class TestConfig:
     timeout_seconds: float
     parameter_timeout_seconds: float
     channel_tolerance_us: int
+    initial_rf_band: str
+    initial_packet_rate: str
+    telemetry_ratio: str
+    manual_bind: bool
+    reestablish_timeout_seconds: float
+    post_link_dwell_seconds: float
 
 
 @dataclass(frozen=True)
@@ -28,6 +34,7 @@ class UnitConfig:
     port: str  # flash/serial port (by-path preferred)
     flash_baud: int
     rx_baud: int  # runtime CRSF baud (rx role only, patched via --rx-baud)
+    lock_on_first_connection: bool
     domain: str  # regulatory domain for 900M-capable units, e.g. fcc_915 ("" = firmware default)
 
 
@@ -45,6 +52,7 @@ def load_config(path: Path) -> TestConfig:
     rx = parser["rx"]
     tx = parser["tx"]
     test = parser["test"]
+    rf_sweep = parser["rf_sweep"]
     return TestConfig(
         rx_port=rx["port"],
         rx_baud=rx.getint("baud"),
@@ -54,6 +62,12 @@ def load_config(path: Path) -> TestConfig:
         timeout_seconds=test.getfloat("timeout_seconds", 20.0),
         parameter_timeout_seconds=test.getfloat("parameter_timeout_seconds", 3.0),
         channel_tolerance_us=test.getint("channel_tolerance_us", 8),
+        initial_rf_band=rf_sweep["initial_band"],
+        initial_packet_rate=rf_sweep["initial_rate"],
+        telemetry_ratio=rf_sweep["telemetry_ratio"],
+        manual_bind=rf_sweep.getboolean("manual_bind"),
+        reestablish_timeout_seconds=rf_sweep.getfloat("reestablish_timeout_seconds"),
+        post_link_dwell_seconds=rf_sweep.getfloat("post_link_dwell_seconds"),
     )
 
 
@@ -76,7 +90,9 @@ def load_fork_config(path: Path) -> ForkConfig:
             target=unit["target"],
             port=unit["port"],
             flash_baud=unit.getint("flash_baud", 460800),
-            rx_baud=unit.getint("rx_baud", 420000),
+            rx_baud=unit.getint("rx_baud", 115200),
+            lock_on_first_connection=(unit.getboolean("lock_on_first_connection")
+                                      if unit["role"] == "rx" else False),
             domain=unit.get("domain", "").strip(),
         )
     return ForkConfig(

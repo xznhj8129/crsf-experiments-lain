@@ -1,9 +1,9 @@
 [rx]
-# RadioMaster XR via external CP2102 at the standard CRSF baud used by the FC.
+# RadioMaster XR via external CP2102 at the adapter's exact 460800 baud divisor.
 # by-path names: both CP2102s report serial "0001" so by-id collides and ttyUSB
 # numbering swaps on replug. These are stable per physical USB socket.
 port = /dev/serial/by-path/pci-0000:02:00.0-usb-0:9:1.0-port0
-baud = 420000
+baud = 460800
 
 [tx]
 # RadioMaster Nomad USB-C (internal CP2102 -> ESP32 UART0). On the stock layout this
@@ -20,6 +20,17 @@ handset_baud = 921600
 timeout_seconds = 75
 parameter_timeout_seconds = 3.0
 channel_tolerance_us = 8
+
+[rf_sweep]
+# Known starting/restoration mode. Rate labels are resolved only after selecting
+# this band because ELRS advertises a different packet-rate table for each band.
+initial_band = 2.4GHz
+initial_rate = 333Hz Full(-105dBm)
+telemetry_ratio = 1:2
+# Set true to command both directly connected devices into bind mode first.
+manual_bind = false
+reestablish_timeout_seconds = 30
+post_link_dwell_seconds = 1
 
 [fork]
 # Firmware source tree and the user_defines.txt containing MY_BINDING_PHRASE.
@@ -41,5 +52,7 @@ target = radiomaster.rx_dual.xr1
 port = /dev/serial/by-path/pci-0000:02:00.0-usb-0:9:1.0-port0
 # runtime CRSF baud, patched into the image via --rx-baud and used for the
 # bl-trigger + in-app-stub flashing path (no reset lines on this adapter)
-rx_baud = 420000
+rx_baud = 460800
+# Required for rate/band sweeps: a disconnected RX must scan other RF modes.
+lock_on_first_connection = false
 domain = fcc_915

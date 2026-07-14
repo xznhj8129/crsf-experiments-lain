@@ -68,7 +68,9 @@ def patch(fork: ForkConfig, unit: UnitConfig, flash: bool = False) -> None:
     if unit.role == "tx":
         cmd.append("--tx")
     else:
-        cmd.extend(["--rx-baud", str(unit.rx_baud)])
+        cmd.extend(["--rx-baud", str(unit.rx_baud),
+                    "--lock-on-first-connection" if unit.lock_on_first_connection
+                    else "--no-lock-on-first-connection"])
     if unit.domain:
         cmd.extend(["--domain", unit.domain])
     if flash:
@@ -95,10 +97,9 @@ def trigger_rx_bootloader(unit: UnitConfig) -> None:
     time.sleep(0.3)
 
 
-def flash_rx_stub(fork: ForkConfig, unit: UnitConfig) -> None:
+def flash_rx_stub(fork: ForkConfig, unit: UnitConfig, firmware: Path) -> None:
     """Flash the app image through the in-app esptool stub (needs the fork's
     patched esptool for its --passthrough flag; plain esptool expects the ROM)."""
-    firmware = build_dir(fork, unit) / "firmware.bin"
     chip = "esp32c3" if "C3" in unit.env else "esp32"
     snippet = (
         "import sys; sys.path.insert(0, 'python/external/esptool'); sys.path.append('python');"
@@ -115,7 +116,7 @@ def flash(fork: ForkConfig, unit: UnitConfig) -> None:
     if unit.role == "rx":
         patch(fork, unit)
         trigger_rx_bootloader(unit)
-        flash_rx_stub(fork, unit)
+        flash_rx_stub(fork, unit, build_dir(fork, unit) / "firmware.bin")
     else:
         # TX has working auto-reset lines: binary_configurator patches and flashes
         # bootloader+partitions+boot_app0+app via UART (littlefs untouched).
