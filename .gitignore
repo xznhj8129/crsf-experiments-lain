@@ -1,6 +1,3 @@
-wifi_credentials.h
-secrets.h
-.pio/
-.vscode/
-*/.pio/
-*/.vscode/
+__pycache__/
+*.log
+backups/

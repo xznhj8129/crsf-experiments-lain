@@ -37,7 +37,6 @@ MID_US = 1500
 UDP_PAYLOAD_LEN = 4 + CHANNEL_COUNT * 2
 UDP_PACKET_LEN = UDP_PAYLOAD_LEN + 4
 WRITE_TIMEOUT_S = 0.1
-SERIAL_PREVIEW_LEN = 24
 DEFAULT_BAUD = 115200
 SERIAL_RX_HEADERS = (CRSF_SYNC, CRSF_TRANSMITTER)
 FAILSAFE_DEFAULT_US = [
@@ -97,7 +96,7 @@ def crsf_to_us(v: int) -> int:
 def packCrsfToBytes(channels) -> bytes:
     # channels are 16 ints in CRSF range (0..1811, typical 172..1811)
     if len(channels) != CHANNEL_COUNT:
-        raise ValueError("CRSF must have 16 channels")
+        raise ValueError(f"CRSF must have {CHANNEL_COUNT} channels")
     result = bytearray()
     destShift = 0
     newVal = 0
@@ -125,7 +124,7 @@ def channelsCrsfToChannelsPacket(channels_crsf) -> bytes:
 def channelsUsToPacket(us_channels) -> bytes:
     # us_channels: list of 16 microsecond values
     if len(us_channels) != CHANNEL_COUNT:
-        raise ValueError("Need 16 channels")
+        raise ValueError(f"Need {CHANNEL_COUNT} channels")
     crsf_ch = [us_to_crsf(v) for v in us_channels]
     return channelsCrsfToChannelsPacket(crsf_ch)
 
@@ -403,7 +402,7 @@ def main():
                     print(
                         f"Serial rx chunk_len={len(chunk)} "
                         f"buffer_len={len(input_buf)} "
-                        f"chunk_hex={chunk[:SERIAL_PREVIEW_LEN].hex()}"
+                        f"chunk_hex={chunk.hex()}"
                     )
 
             # Parse CRSF frames from buffer
@@ -419,7 +418,7 @@ def main():
                             print(
                                 f"Serial discard reason=no_sync "
                                 f"discard_len={len(input_buf)} "
-                                f"discard_hex={bytes(input_buf[:SERIAL_PREVIEW_LEN]).hex()}"
+                                f"discard_hex={bytes(input_buf).hex()}"
                             )
                         input_buf.clear()
                         break
@@ -427,7 +426,7 @@ def main():
                         print(
                             f"Serial discard reason=resync "
                             f"discard_len={sync_index} "
-                            f"discard_hex={bytes(input_buf[:sync_index])[:SERIAL_PREVIEW_LEN].hex()}"
+                            f"discard_hex={bytes(input_buf[:sync_index]).hex()}"
                         )
                     del input_buf[:sync_index]
                     if len(input_buf) <= 2:
@@ -439,7 +438,7 @@ def main():
                             f"Serial discard reason=bad_len "
                             f"len_byte={input_buf[1]} "
                             f"buffer_len={len(input_buf)} "
-                            f"buffer_hex={bytes(input_buf[:SERIAL_PREVIEW_LEN]).hex()}"
+                            f"buffer_hex={bytes(input_buf).hex()}"
                         )
                     del input_buf[0]
                     continue
@@ -461,7 +460,7 @@ def main():
                         f"Serial frame_header=0x{frame[0]:02x} "
                         f"Serial frame_ok len={len(frame)} "
                         f"type=0x{frame[2]:02x} "
-                        f"frame_hex={frame[:SERIAL_PREVIEW_LEN].hex()}"
+                        f"frame_hex={frame.hex()}"
                     )
                 if tele_sock is not None:
                     try:
@@ -525,7 +524,12 @@ def main():
                     last_tx_debug_t = now
                 try:
                     frame = channelsUsToPacket(active)
-                    ser.write(frame)
+                    written = ser.write(frame)
+                    if args.debug:
+                        print(
+                            f"Serial tx frame_len={len(frame)} written={written} "
+                            f"type=0x{frame[2]:02x} frame_hex={frame.hex()}"
+                        )
                 except serial.SerialTimeoutException as e:
                     print(f"Serial write timeout port={args.device} baud={args.baud} frame_len={len(frame)} elapsed_ms={elapsed_ms:.1f} err={e}")
                 last_tx_t = now
