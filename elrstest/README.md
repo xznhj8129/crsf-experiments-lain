@@ -36,9 +36,13 @@ assignment. The script does not open or wait for the RX endpoint.
 
 Verified working against a RadioMaster Nomad and a RadioMaster XR1, both on
 stock ExpressLRS 4.0.1, behind two CP2102 adapters. The XR1 normally uses
-420000 CRSF; this bench deliberately configures it for 115200 because the
-classic CP2102 is unreliable at 420000/460800. With the Nomad's hardware.json
-override applied (below),
+420000 CRSF; this bench configures it for 460800 because the classic CP2102
+is unreliable at 420000 (an inexact divisor) while 460800 and 115200 are
+exact. 460800 is preferred: 115200 cannot carry K1000-rate RC output. The
+XR1 currently runs `backups/xr1_stock401_460800_fcc915.bin` — stock 4.0.1
+with baked-in UID, regulatory domain FCC915 (must match the TX or 915MHz
+and X-Band never link), 460800 baud, and lock-on-first-connection disabled.
+With the Nomad's hardware.json override applied (below),
 the full 9-check smoke passes over nothing but the two USB cables: RX CRSF
 output, RX device info + parameters, TX boot probe, handset sync (333 Hz),
 TX device info, RF link up, RC passthrough, and telemetry return.
@@ -191,14 +195,16 @@ Nomad USB-C path in `[tx].flash_port`, `[tx].handset_port`, and
 
 ```ini
 [rx]
-baud = 115200
+baud = 460800
 
 [unit.xr1]
-rx_baud = 115200
+rx_baud = 460800
 ```
 
-Do not use 420000 or 460800 with the classic CP2102. On this adapter those
-rates are quantized badly enough to corrupt the stream.
+Do not use 420000 with the classic CP2102. On this adapter those
+arbitrary rates are quantized badly enough to corrupt the stream.
+(This recovery was originally performed at 115200, which also divides
+exactly; the bench later moved to 460800 for K1000 headroom.)
 
 ### 2. Recognize the false high-baud result
 
@@ -249,9 +255,25 @@ really the XR1 and the image is 4.0.1:
 strings "$BINARY_TARGETS/firmware.bin" | grep -E 'RadioMaster XR1|RM XR1|4\.0\.1'
 ```
 
-The configured image already contains the binding UID, regulatory domain,
-and WiFi settings selected in Configurator. Make a workspace backup and patch
-only the receiver UART baud:
+**Do not assume the cached image carries any options.** The binary-targets
+cache can be a bare target image, and each flasher patch pass **replaces the
+options block wholesale** with only the flags given on that command line.
+This bench lost a day to it: an image patched with only `--rx-baud` shipped
+with no `uid` and no `domain`, so the RX fell back to the AU915 default while
+the TX was FCC915 — every 2.4GHz mode passed and 915MHz/X-Band never linked
+(binding still worked because the bound UID survives in NVS). Always pass the
+full set — phrase, domain, rx-baud, lock flag — and verify the options JSON
+in the image tail afterwards:
+
+```bash
+python3 - <<'PY'
+import re
+d = open("backups/xr1_stock401_460800_fcc915.bin","rb").read()
+print(re.search(rb'\{"[^\x00]*?"rcvr-uart-baud"[^\x00]*?\}', d).group(0).decode())
+PY
+```
+
+Make a workspace backup and patch with the complete option set:
 
 ```bash
 mkdir -p backups
@@ -409,17 +431,24 @@ After `smoke` passes, run the longer hardware function test:
 python3 elrstest.py rf-sweep
 ```
 
+Every top-level script also mirrors its complete stdout/stderr into
+`{scriptname}.log` (`elrstest.log`, `elrsflash.log`, `config.log`), truncated
+per run — read results from there instead of scrollback.
+
 Every `smoke` and `rf-sweep` run truncates `rx.log` and `tx.log`, then writes
 the complete decoded CRSF traffic for that endpoint with monotonic timestamp,
-direction, and raw frame hex. The files are line-buffered and can be followed
-while the test is running:
+direction, and raw frame hex. A frame repeating unchanged in one direction is
+collapsed into a single `... repeated N more times ...` marker, emitted when
+that direction's traffic changes (an unchanging RC stream no longer produces
+megabytes of identical lines). The files are line-buffered and can be
+followed while the test is running:
 
 ```bash
 tail -F rx.log tx.log
 ```
 
-Set the known starting/restoration mode and optional manual binding in
-`elrstest.ini`:
+Set the known starting/restoration mode, optional manual binding, and test
+scope in `elrstest.ini`:
 
 ```ini
 [rf_sweep]
@@ -429,7 +458,17 @@ telemetry_ratio = 1:2
 manual_bind = false
 reestablish_timeout_seconds = 30
 post_link_dwell_seconds = 1
+# scope: 'all', or comma-separated band labels / rate-label prefixes;
+# test_rates = none sweeps band transitions only (~30 s on this bench)
+test_bands = 2.4GHz,915MHz
+test_rates = all
 ```
+
+`test_bands` limits which advertised bands are entered (this bench excludes
+X-Band: the XR1's single LR1121 cannot receive Dual-Band modes, so testing it
+can only fail). `test_rates` limits the per-band rate sweep to matching
+label prefixes (`250Hz,K1000`), or skips rate sweeping entirely with `none`
+to exercise exactly the band-change path.
 
 The test selects `initial_band` first, rereads that band's dynamic packet-rate
 table, resolves `initial_rate` by its live label, and sets and verifies
@@ -614,7 +653,9 @@ the complete hardware smoke test. The RX must already be at the configured
 
 | Symptom | Meaning and next check |
 | --- | --- |
-| Repeating `0x3E ... f0010f7c33`, huge CRC/discard counts | CP2102 corruption at the high RX baud. Reflash the RX for 115200 over WiFi. |
+| Repeating `0x3E ... f0010f7c33`, huge CRC/discard counts | CP2102 corruption at an inexact baud (420000). Reflash the RX for 460800 (or 115200) over WiFi. |
+| Every 2.4GHz mode passes but 915MHz and X-Band never link (`tx_connected=False`, no status message, RX silent) | Regulatory domain mismatch: 2.4GHz is domain-free, 900MHz FHSS tables differ per domain. Extract the options JSON from the flashed image tail — a missing `domain` key means the AU915 default. Repatch with `--domain fcc_915` on both ends. |
+| 915MHz links but X-Band never does, on an XR1 | Hardware, not config: X-Band (Gemini Xrossband) modes are Dual-Band and stock `isSupportedRFRate()` rejects them on single-LR1121 receivers. The XR1 has one LR1121; only dual-radio RXs (DBR4 class) can receive X-Band. Expected sweep failure with this pair. |
 | `tx_flash_probe` passes but `tx_handset_sync` fails | ESP32 boots, but runtime CRSF is not on USB pins. Check the Nomad LittleFS pin override and handset baud. |
 | `tx_handset_sync` passes but LINK LQ stays zero | USB handset emulation works; wait through cold RF startup, then check phrase, domain, and model match. |
 | LINK reaches LQ 100 but no RC frame appears at the RX adapter | Check RX baud and parser CRC/discard counters before blaming RF. The corrupt high-baud capture produced this exact illusion. |

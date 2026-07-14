@@ -23,6 +23,8 @@ class TestConfig:
     manual_bind: bool
     reestablish_timeout_seconds: float
     post_link_dwell_seconds: float
+    test_bands: tuple[str, ...]  # empty = every advertised band
+    test_rates: tuple[str, ...]  # empty = every advertised rate; ("none",) = band transitions only
 
 
 @dataclass(frozen=True)
@@ -68,7 +70,18 @@ def load_config(path: Path) -> TestConfig:
         manual_bind=rf_sweep.getboolean("manual_bind"),
         reestablish_timeout_seconds=rf_sweep.getfloat("reestablish_timeout_seconds"),
         post_link_dwell_seconds=rf_sweep.getfloat("post_link_dwell_seconds"),
+        test_bands=_selection_list(rf_sweep.get("test_bands", "all")),
+        test_rates=_selection_list(rf_sweep.get("test_rates", "all")),
     )
+
+
+def _selection_list(raw: str) -> tuple[str, ...]:
+    """'all' (or blank) -> () meaning no restriction; otherwise a tuple of
+    comma-separated selectors ('none' passes through as an explicit selector)."""
+    raw = raw.strip()
+    if not raw or raw.lower() == "all":
+        return ()
+    return tuple(item.strip() for item in raw.split(",") if item.strip())
 
 
 def load_fork_config(path: Path) -> ForkConfig:

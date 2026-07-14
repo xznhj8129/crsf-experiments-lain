@@ -18,6 +18,7 @@ from pathlib import Path
 from elrstest.config import load_config
 from elrstest.crsf import CRSF_ADDRESS_TRANSMITTER
 from elrstest.link import HandsetSession, ParameterClient, SerialPort, parameter_text
+from elrstest.teelog import tee_output
 
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "elrstest.ini"
@@ -26,6 +27,7 @@ POST_WRITE_RC_SECONDS = 1.0
 
 
 def main() -> int:
+    tee_output(__file__)
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)

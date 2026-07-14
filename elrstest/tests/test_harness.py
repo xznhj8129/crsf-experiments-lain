@@ -26,13 +26,13 @@ def parse_one(raw: bytes):
 
 
 class HandsetSessionTests(unittest.TestCase):
-    def test_first_poll_sends_rc_at_5hz_default(self) -> None:
+    def test_first_poll_sends_rc_at_20hz_default(self) -> None:
         port = FakePort()
         session = HandsetSession(port)
         session.poll()
         self.assertEqual(len(port.writes), 1)
         self.assertEqual(port.writes[0], make_rc_frame(session.channels_us))
-        self.assertAlmostEqual(session.interval, 0.2)
+        self.assertAlmostEqual(session.interval, 0.05)
 
     def test_pending_frames_piggyback_on_rc_write(self) -> None:
         port = FakePort()
@@ -99,3 +99,31 @@ class ParameterClientTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TrafficLogDedupTests(unittest.TestCase):
+    def test_identical_frames_collapse_per_direction(self) -> None:
+        import io
+        from elrstest.link import SerialPort
+
+        port = SerialPort.__new__(SerialPort)
+        port.traffic_log = io.StringIO()
+        port.traffic_started = 0.0
+        port._last_traffic_line = {}
+        port._suppressed_repeats = {}
+
+        rc = parse_one(make_rc_frame([1500] * 16))
+        other = parse_one(make_frame(FrameType.LINK_STATISTICS, bytes(10)))
+        for _ in range(5):
+            port._log_traffic("HOST->PORT", rc)
+        port._log_traffic("PORT->HOST", other)  # other direction must not flush RC repeats
+        for _ in range(3):
+            port._log_traffic("HOST->PORT", rc)
+        port._log_traffic("HOST->PORT", other)  # direction content changed: flush marker
+        port._flush_repeats()
+        lines = port.traffic_log.getvalue().splitlines()
+        rc_lines = [l for l in lines if "RC" in l and "repeated" not in l]
+        markers = [l for l in lines if "repeated" in l]
+        self.assertEqual(len(rc_lines), 1)
+        self.assertEqual(len(markers), 1)
+        self.assertIn("HOST->PORT ... repeated 7 more times ...", markers[0])

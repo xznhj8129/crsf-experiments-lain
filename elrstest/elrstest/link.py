@@ -72,6 +72,8 @@ class SerialPort:
         self.traffic_log_path = traffic_log
         self.traffic_log = None
         self.traffic_started = 0.0
+        self._last_traffic_line: dict[str, str] = {}
+        self._suppressed_repeats: dict[str, int] = {}
         self.bytes_read = 0
         self.bytes_written = 0
         self.serial = serial.Serial()
@@ -93,8 +95,32 @@ class SerialPort:
     def close(self) -> None:
         self.serial.close()
         if self.traffic_log:
+            self._flush_repeats()
             self.traffic_log.close()
             self.traffic_log = None
+
+    def _flush_repeats(self, direction: str | None = None) -> None:
+        directions = [direction] if direction else list(self._suppressed_repeats)
+        for name in directions:
+            count = self._suppressed_repeats.get(name, 0)
+            if count:
+                elapsed = time.monotonic() - self.traffic_started
+                print(f"{elapsed:10.6f} {name} ... repeated {count} more times ...",
+                      file=self.traffic_log, flush=True)
+                self._suppressed_repeats[name] = 0
+
+    def _log_traffic(self, direction: str, frame: Frame) -> None:
+        """Write a decoded frame. An unchanged frame repeating in one direction
+        collapses into a '... repeated N more times ...' marker, emitted when
+        that direction's traffic changes (or the port closes)."""
+        line = f"{direction} {describe_frame(frame)} raw={frame.raw.hex()}"
+        if line == self._last_traffic_line.get(direction):
+            self._suppressed_repeats[direction] = self._suppressed_repeats.get(direction, 0) + 1
+            return
+        self._flush_repeats(direction)
+        self._last_traffic_line[direction] = line
+        elapsed = time.monotonic() - self.traffic_started
+        print(f"{elapsed:10.6f} {line}", file=self.traffic_log, flush=True)
 
     def read_frames(self) -> list[Frame]:
         waiting = self.serial.in_waiting
@@ -105,9 +131,7 @@ class SerialPort:
         frames = self.parser.feed(data)
         if self.traffic_log:
             for frame in frames:
-                elapsed = time.monotonic() - self.traffic_started
-                print(f"{elapsed:10.6f} PORT->HOST {describe_frame(frame)} raw={frame.raw.hex()}",
-                      file=self.traffic_log, flush=True)
+                self._log_traffic("PORT->HOST", frame)
         return frames
 
     def write(self, data: bytes) -> None:
@@ -115,9 +139,7 @@ class SerialPort:
         self.bytes_written += len(data)
         if self.traffic_log:
             for frame in self.write_parser.feed(data):
-                elapsed = time.monotonic() - self.traffic_started
-                print(f"{elapsed:10.6f} HOST->PORT {describe_frame(frame)} raw={frame.raw.hex()}",
-                      file=self.traffic_log, flush=True)
+                self._log_traffic("HOST->PORT", frame)
 
     def __enter__(self) -> SerialPort:
         self.open()

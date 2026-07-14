@@ -469,6 +469,18 @@ def run_rf_sweep(config: TestConfig) -> SmokeReport:
 
         band_order = [original_band] + [index for index, option in enumerate(band.options)
                                         if option and index != original_band]
+        skip_rate_sweep = config.test_rates == ("none",)
+        if config.test_bands:
+            skipped = [band.options[i] for i in band_order
+                       if band.options[i] not in config.test_bands and i != original_band]
+            band_order = [i for i in band_order
+                          if band.options[i] in config.test_bands or i == original_band]
+            if skipped:
+                print(f"test_bands={','.join(config.test_bands)} skipping={','.join(skipped)}",
+                      flush=True)
+        if skip_rate_sweep:
+            print("test_rates=none: band transitions only, per-band rate sweeps skipped",
+                  flush=True)
         for band_index in band_order:
             band_name = band.options[band_index]
             if band_index != original_band:
@@ -501,6 +513,8 @@ def run_rf_sweep(config: TestConfig) -> SmokeReport:
                         return report
                     continue
 
+            if skip_rate_sweep:
+                continue
             rate = client.read(CRSF_ADDRESS_TRANSMITTER, rate.id)
             current_rate = rate.value
             current_rate_name = rate.options[current_rate]
@@ -510,6 +524,9 @@ def run_rf_sweep(config: TestConfig) -> SmokeReport:
                   flush=True)
             for rate_index, rate_name in enumerate(rate.options):
                 if not rate_name or rate_index == current_rate:
+                    continue
+                if config.test_rates and not any(
+                        rate_name.startswith(selector) for selector in config.test_rates):
                     continue
                 previous_rate = current_rate
                 previous_rate_name = rate.options[previous_rate]

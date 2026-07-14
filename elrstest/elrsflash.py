@@ -26,6 +26,7 @@ from pathlib import Path
 from elrstest.config import ForkConfig, UnitConfig, load_config, load_fork_config
 from elrstest.crsf import FrameType, make_frame
 from elrstest.link import HandsetSession, ParameterClient, RxLink, SerialPort
+from elrstest.teelog import tee_output
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "elrstest.ini"
 CRSF_ADDRESS_RECEIVER = 0xEC
@@ -45,10 +46,19 @@ def build_dir(fork: ForkConfig, unit: UnitConfig) -> Path:
 
 
 def run_logged(cmd: list[str], cwd: Path, timeout: float = 900) -> None:
+    """Run a command streaming its output through our stdout (and the tee log)."""
     print(f"+ {' '.join(str(c) for c in cmd)}", flush=True)
-    result = subprocess.run(cmd, cwd=cwd, timeout=timeout)
-    if result.returncode != 0:
-        raise RuntimeError(f"command failed with exit {result.returncode}: {cmd[0]}")
+    process = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True, errors="replace")
+    deadline = time.monotonic() + timeout
+    for line in process.stdout:
+        print(line, end="", flush=True)
+        if time.monotonic() > deadline:
+            process.kill()
+            raise TimeoutError(f"command exceeded {timeout}s: {cmd[0]}")
+    returncode = process.wait()
+    if returncode != 0:
+        raise RuntimeError(f"command failed with exit {returncode}: {cmd[0]}")
 
 
 def build(fork: ForkConfig, unit: UnitConfig) -> None:
@@ -151,6 +161,7 @@ def verify(config, fork: ForkConfig, unit: UnitConfig, settle_seconds: float = 4
 
 
 def main() -> int:
+    tee_output(__file__)
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)

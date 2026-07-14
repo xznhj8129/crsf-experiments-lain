@@ -39,6 +39,7 @@ from elrstest.link import (
 )
 from elrstest.smoke import run_smoke
 from elrstest.sweep import run_rf_sweep
+from elrstest.teelog import tee_output
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "elrstest.ini"
 
@@ -164,6 +165,7 @@ def run_endpoint_command(args: argparse.Namespace, config: TestConfig) -> int:
 
 
 def main() -> int:
+    tee_output(__file__)
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)

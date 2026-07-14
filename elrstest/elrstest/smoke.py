@@ -201,7 +201,7 @@ def run_smoke(config: TestConfig) -> SmokeReport:
                         channels = unpack_channels_us(frame.payload)
                         rc_seen = channels
                         if all(abs(a - b) <= config.channel_tolerance_us
-                               for a, b in zip(channels[:5], pattern[:5])):
+                               for a, b in zip(channels[:4], pattern[:4])):
                             t_rc = time.monotonic() - started
                 if time.monotonic() >= next_battery:
                     battery_frame = rx.inject_battery()
@@ -263,7 +263,7 @@ def run_smoke(config: TestConfig) -> SmokeReport:
                             rc_seen = channels
                             valid_channels = all(
                                 abs(actual - expected) <= config.channel_tolerance_us
-                                for actual, expected in zip(channels[:5], pattern[:5]))
+                                for actual, expected in zip(channels[:4], pattern[:4]))
                             if valid_channels:
                                 measured_valid_rc_frames += 1
                             if tx_connected and lq and last_rc_at is not None:

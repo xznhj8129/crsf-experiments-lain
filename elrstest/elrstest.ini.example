@@ -25,24 +25,33 @@ channel_tolerance_us = 8
 # Known starting/restoration mode. Rate labels are resolved only after selecting
 # this band because ELRS advertises a different packet-rate table for each band.
 initial_band = 2.4GHz
-initial_rate = 333Hz Full(-105dBm)
+initial_rate = DK500(-103dBm)
 telemetry_ratio = 1:2
-# Set true to command both directly connected devices into bind mode first.
+# Put both directly connected devices into bind mode before the initial link wait.
 manual_bind = false
 reestablish_timeout_seconds = 30
 post_link_dwell_seconds = 1
 
+# Restrict what rf-sweep tests. test_bands: 'all' or comma-separated band labels
+# exactly as the TX advertises them (this pair cannot receive X-Band: the XR1
+# has a single LR1121 and stock firmware rejects Dual-Band modes on it).
+# test_rates: 'all', 'none' (band transitions only — the fast path), or
+# comma-separated rate-label prefixes, e.g. 250Hz,K1000
+test_bands = 2.4GHz,915MHz
+test_rates = all
+
 [fork]
-# Firmware source tree and the user_defines.txt containing MY_BINDING_PHRASE.
-dir = ../ExpressLRS
-binding_defines = ../ExpressLRS/src/user_defines.txt
+# Stock ExpressLRS firmware source. Keep the established binding phrase in its
+# existing defines file without importing that tree's compile flags.
+dir = /media/anon/WD2TB/DataVault/TechProjects/Software/other_software/ExpressLRS
+binding_defines = /media/anon/WD2TB/DataVault/TechProjects/Software/GitRepos/PrivacyLRS/src/user_defines.txt
 
 [unit.nomad]
 role = tx
 env = Unified_ESP32_LR1121_TX_via_UART
 target = radiomaster.tx_dual.nomad
 port = /dev/serial/by-path/pci-0000:02:00.0-usb-0:8:1.0-port0
-flash_baud = 460800
+flash_baud = 921600
 domain = fcc_915
 
 [unit.xr1]
