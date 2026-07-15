@@ -107,12 +107,15 @@ def run_smoke(config: TestConfig) -> SmokeReport:
         report.add("rx_passive_output", "SKIP", "rx port unavailable")
 
     # 4. TX flash port: module powered and booting (also un-wedges a held-in-reset chip)
-    if config.tx_flash_port:
+    if config.tx_flash_port and config.tx_flash_port != config.tx_handset_port:
         try:
             probe = flash_probe(config.tx_flash_port)
             report.add("tx_flash_probe", "PASS" if probe.app_booting else "FAIL", probe.summary())
         except Exception as error:
             report.add("tx_flash_probe", "FAIL", f"{type(error).__name__}: {error}")
+    elif config.tx_flash_port:
+        report.add("tx_flash_probe", "SKIP",
+                   "shared handset port — avoid resetting it immediately before live CRSF use")
     else:
         report.add("tx_flash_probe", "SKIP", "no tx flash_port configured")
 
@@ -178,21 +181,29 @@ def run_smoke(config: TestConfig) -> SmokeReport:
             rc_seen = None
             lq = None
             mode = None
+            last_link_payload = None
             rx_counts: dict[int, int] = {}
             tx_counts: dict[int, int] = {}
+            initial_status = None
+            diag_samples = []
             battery_frame = rx.inject_battery()
             next_battery = started + 0.2
+            next_status_request = started
+            next_diag_sample = started + 1.0
             deadline = started + config.timeout_seconds
             while time.monotonic() < deadline and not all(
                     value is not None for value in (t_link, t_rc, t_telemetry)):
                 for frame in handset.poll():
                     tx_counts[frame.type] = tx_counts.get(frame.type, 0) + 1
+                    if frame.type == FrameType.ELRS_STATUS and len(frame.extended_payload) >= 4:
+                        initial_status = frame.extended_payload[:4].hex()
                     if frame.type == FrameType.BATTERY_SENSOR and frame.raw == battery_frame \
                             and t_telemetry is None:
                         t_telemetry = time.monotonic() - started
                 for frame in rx.poll():
                     rx_counts[frame.type] = rx_counts.get(frame.type, 0) + 1
                     if frame.type == FrameType.LINK_STATISTICS:
+                        last_link_payload = frame.payload.hex()
                         lq = frame.payload[2]
                         mode = frame.payload[5]
                         if lq > 0 and t_link is None:
@@ -206,6 +217,19 @@ def run_smoke(config: TestConfig) -> SmokeReport:
                 if time.monotonic() >= next_battery:
                     battery_frame = rx.inject_battery()
                     next_battery = time.monotonic() + 0.2
+                if time.monotonic() >= next_status_request:
+                    handset.queue(make_extended_frame(
+                        FrameType.PARAMETER_WRITE,
+                        CRSF_ADDRESS_TRANSMITTER,
+                        handset.origin(CRSF_ADDRESS_TRANSMITTER),
+                        bytes([0, 0]),
+                    ))
+                    next_status_request = time.monotonic() + 1.0
+                if time.monotonic() >= next_diag_sample:
+                    diag_samples.append(
+                        f"{time.monotonic() - started:.1f}:rx={last_link_payload},tx={initial_status}"
+                    )
+                    next_diag_sample = time.monotonic() + 2.0
                 time.sleep(0.001)
             measurement_seconds = 0.0
             radio_id_rate_hz = 1 / handset.interval
@@ -255,6 +279,7 @@ def run_smoke(config: TestConfig) -> SmokeReport:
                         frame_at = time.monotonic()
                         rx_counts[frame.type] = rx_counts.get(frame.type, 0) + 1
                         if frame.type == FrameType.LINK_STATISTICS:
+                            last_link_payload = frame.payload.hex()
                             lq = frame.payload[2]
                             mode = frame.payload[5]
                         elif frame.type == FrameType.RC_CHANNELS_PACKED:
@@ -303,8 +328,11 @@ def run_smoke(config: TestConfig) -> SmokeReport:
                 )
             window = f" within {config.timeout_seconds:.0f}s"
             report.add("link_up", "PASS" if t_link is not None else "FAIL",
-                       f"RX reports LQ > 0 after {t_link:.1f}s" if t_link is not None else
-                       f"RX never reported LQ > 0{window} — modules bound? TX transmitting?")
+                       f"RX reports LQ > 0 after {t_link:.1f}s link_payload={last_link_payload} "
+                       f"tx_status={initial_status}" if t_link is not None else
+                       f"RX never reported LQ > 0{window} — modules bound? TX transmitting? "
+                       f"link_payload={last_link_payload} tx_status={initial_status} "
+                       f"timeline={';'.join(diag_samples)}")
             report.add("rc_passthrough", "PASS" if t_rc is not None and measurement_passed
                        else "FAIL",
                        f"RX outputs sent pattern after {t_rc:.1f}s {rc_seen[:5]} "
@@ -321,10 +349,11 @@ def run_smoke(config: TestConfig) -> SmokeReport:
                        f"longest_rc_gap_ms={longest_rc_gap * 1000:.3f} "
                        f"link_dropout_events={link_dropout_events} lq={lq} mode={mode} "
                        f"tx_connected={tx_connected} status_frames={status_frames} "
-                       f"status_flags={status_flags}"
+                       f"status_flags={status_flags} timeline={';'.join(diag_samples)}"
                        if t_rc is not None else
                        f"sent={pattern[:5]} last_rx={rc_seen[:5] if rc_seen else None} "
-                       f"rx_types={dict(sorted(rx_counts.items()))}{window}")
+                       f"rx_types={dict(sorted(rx_counts.items()))} link_payload={last_link_payload} "
+                       f"tx_status={initial_status} timeline={';'.join(diag_samples)}{window}")
             report.add("telemetry_return", "PASS" if t_telemetry is not None else "FAIL",
                        f"injected battery frame back on TX side after {t_telemetry:.1f}s"
                        if t_telemetry is not None else

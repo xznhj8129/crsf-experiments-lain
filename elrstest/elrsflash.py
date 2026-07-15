@@ -17,7 +17,6 @@ hardware.json USB-handset override survives every firmware flash.
 from __future__ import annotations
 
 import argparse
-import re
 import subprocess
 import sys
 import time
@@ -33,21 +32,16 @@ CRSF_ADDRESS_RECEIVER = 0xEC
 CRSF_ADDRESS_TRANSMITTER = 0xEE
 
 
-def read_binding_phrase(defines_path: Path) -> str:
-    defines = defines_path.read_text(encoding="utf-8")
-    match = re.search(r'^\s*-DMY_BINDING_PHRASE="(.+)"\s*$', defines, re.MULTILINE)
-    if not match:
-        raise ValueError(f"no active MY_BINDING_PHRASE in {defines_path}")
-    return match.group(1)
-
-
 def build_dir(fork: ForkConfig, unit: UnitConfig) -> Path:
     return fork.dir / "src" / ".pio" / "build" / unit.env
 
 
 def run_logged(cmd: list[str], cwd: Path, timeout: float = 900) -> None:
     """Run a command streaming its output through our stdout (and the tee log)."""
-    print(f"+ {' '.join(str(c) for c in cmd)}", flush=True)
+    display_cmd = [str(value) for value in cmd]
+    if "--phrase" in display_cmd:
+        display_cmd[display_cmd.index("--phrase") + 1] = "<redacted>"
+    print(f"+ {' '.join(display_cmd)}", flush=True)
     process = subprocess.Popen(cmd, cwd=cwd, stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, text=True, errors="replace")
     deadline = time.monotonic() + timeout
@@ -71,10 +65,9 @@ def build(fork: ForkConfig, unit: UnitConfig) -> None:
 
 
 def patch(fork: ForkConfig, unit: UnitConfig, flash: bool = False) -> None:
-    phrase = read_binding_phrase(fork.binding_defines)
     firmware = build_dir(fork, unit) / "firmware.bin"
     cmd = [sys.executable, "python/binary_configurator.py", str(firmware),
-           "--target", unit.target, "--phrase", phrase]
+           "--target", unit.target, "--phrase-defines", str(fork.binding_defines)]
     if unit.role == "tx":
         cmd.append("--tx")
     else:
@@ -128,9 +121,19 @@ def flash(fork: ForkConfig, unit: UnitConfig) -> None:
         trigger_rx_bootloader(unit)
         flash_rx_stub(fork, unit, build_dir(fork, unit) / "firmware.bin")
     else:
-        # TX has working auto-reset lines: binary_configurator patches and flashes
-        # bootloader+partitions+boot_app0+app via UART (littlefs untouched).
-        patch(fork, unit, flash=True)
+        patch(fork, unit)
+        image_dir = build_dir(fork, unit)
+        pio_python = Path.home() / ".platformio" / "penv" / "bin" / "python"
+        esptool = Path.home() / ".platformio" / "packages" / "tool-esptoolpy" / "esptool.py"
+        run_logged([
+            str(pio_python), str(esptool), "--chip", "esp32", "--port", unit.port,
+            "--baud", str(unit.flash_baud), "--after", "hard_reset", "write_flash",
+            "-z", "--flash_mode", "dio", "--flash_freq", "40m", "--flash_size", "detect",
+            "0x1000", str(image_dir / "bootloader.bin"),
+            "0x8000", str(image_dir / "partitions.bin"),
+            "0xe000", str(image_dir / "boot_app0.bin"),
+            "0x10000", str(image_dir / "firmware.bin"),
+        ], cwd=fork.dir / "src")
 
 
 def verify(config, fork: ForkConfig, unit: UnitConfig, settle_seconds: float = 4.0) -> bool:

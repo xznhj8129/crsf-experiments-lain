@@ -123,10 +123,16 @@ class SerialPort:
         print(f"{elapsed:10.6f} {line}", file=self.traffic_log, flush=True)
 
     def read_frames(self) -> list[Frame]:
-        waiting = self.serial.in_waiting
+        try:
+            waiting = self.serial.in_waiting
+        except serial.SerialException as error:
+            raise serial.SerialException(f"{self.device}: {error}") from error
         if not waiting:
             return []
-        data = self.serial.read(waiting)
+        try:
+            data = self.serial.read(waiting)
+        except serial.SerialException as error:
+            raise serial.SerialException(f"{self.device}: {error}") from error
         self.bytes_read += len(data)
         frames = self.parser.feed(data)
         if self.traffic_log:
