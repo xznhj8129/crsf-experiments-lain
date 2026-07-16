@@ -6,7 +6,8 @@ CRSF/ExpressLRS experiments.
   build→define→flash→verify pipeline. Plug TX and RX into USB, get PASS/FAIL
   for CRSF, link, RC, telemetry, and Lua parameters; flash fork builds with
   per-unit defines without touching a button.
-- `crsfproxy/` — CRSF proxy + joystick experiments
+- [`crsfproxy/`](crsfproxy/README.md) — UDP RC/telemetry proxy with remote
+  ELRS Lua configuration and one-shot or curses clients
 - `crsfrecorder/` — telemetry recording
 - `crsf_to_msp/` — CRSF to MSP bridging
 - `esp32-crsf-duplex/`, `udp_crsf/` — ESP32 bridging experiments

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Usage:
-  python crsfproxy.py --device /dev/ttyUSB0 --baud 115200 --host 0.0.0.0 --port 60000 --loop_hz 250 --tx_rate 100 --telemetry_udp 192.168.4.2:40042
+  python crsfproxy.py --device /dev/ttyUSB0 --baud 115200 --host 0.0.0.0 --port 60000 --loop_hz 250 --tx_rate 100 --telemetry_udp 192.168.4.2:40042 --config_udp 60001
 
 CRSF TX side bridge:
 - Listens on a UDP port for 40-byte RC packets: <uint32 t_ms><16 x uint16 us><uint32 crc32>.
@@ -11,6 +11,10 @@ CRSF TX side bridge:
 Telemetry output:
 - Optional raw CRSF frames to --telemetry_udp (host:port)
 
+ELRS configuration:
+- Optional JSON or shell-style Lua configuration commands on --config_udp.
+- Configuration is TX-only and uses the same DEVICE/PARAMETER protocol as elrs.lua.
+
 Failsafe (proxy):
 - If RC updates stop for < failsafe_time_ms, repeat last_valid_channels_us.
 - If RC updates stop for >= failsafe_time_ms, send --failsafe_channels_us (defaults to throttle/arm low).
@@ -19,13 +23,35 @@ Failsafe (proxy):
 """
 
 import argparse
+import json
+import queue
+import shlex
 import socket
 import struct
+import sys
+import threading
 import time
 import zlib
 from enum import IntEnum
+from pathlib import Path
 
 import serial
+
+ELRSTEST_ROOT = Path(__file__).resolve().parent.parent / "elrstest"
+sys.path.insert(0, str(ELRSTEST_ROOT))
+
+from elrstest.crsf import (  # noqa: E402
+    CRSF_ADDRESS_ELRS_LUA,
+    CRSF_ADDRESS_RADIO_TRANSMITTER,
+    CRSF_ADDRESS_TRANSMITTER as ELRS_ADDRESS_TRANSMITTER,
+    DeviceInfo,
+    Frame as CrsfFrame,
+    FrameType,
+    Parameter,
+    ParameterType,
+    make_extended_frame,
+)
+from elrstest.link import ParameterClient  # noqa: E402
 
 CRSF_SYNC = 0xC8
 CRSF_TRANSMITTER = 0xEE
@@ -43,6 +69,261 @@ FAILSAFE_DEFAULT_US = [
     1500, 1500, 900, 1500, 900, 1500, 1500, 1500,
     1500, 1500, 1500, 1500, 1500, 1500, 1500, 1500,
 ]
+CONFIG_RESPONSE_LIMIT = 65507
+CONFIG_STATUS_INTERVAL_S = 1.0
+CONFIG_PARAMETER_TIMEOUT_S = 3.0
+CONFIG_DEVICE_DISCOVERY_S = 2.0
+
+
+def parameter_value(parameter: Parameter):
+    if parameter.type == ParameterType.SELECTION:
+        if parameter.value < len(parameter.options):
+            return parameter.options[parameter.value]
+    return parameter.value
+
+
+def parameter_dict(parameter: Parameter) -> dict:
+    return {
+        "id": parameter.id,
+        "parent": parameter.parent,
+        "type": parameter.type.name,
+        "hidden": parameter.hidden,
+        "name": parameter.name,
+        "value": parameter_value(parameter),
+        "raw_value": parameter.value,
+        "minimum": parameter.minimum,
+        "maximum": parameter.maximum,
+        "default": parameter.default,
+        "unit": parameter.unit,
+        "options": list(parameter.options),
+        "children": list(parameter.children),
+        "command_status": parameter.command_status,
+        "command_timeout": parameter.command_timeout,
+        "command_info": parameter.command_info,
+    }
+
+
+def device_dict(device: DeviceInfo) -> dict:
+    software = device.software_version
+    return {
+        "address": device.address,
+        "name": device.name,
+        "serial": device.serial,
+        "hardware_version": f"0x{device.hardware_version:08X}",
+        "software_version": f"0x{software:08X}",
+        "version": f"{software >> 16}.{software >> 8 & 0xFF}.{software & 0xFF}",
+        "parameter_count": device.parameter_count,
+        "parameter_version": device.parameter_version,
+    }
+
+
+class ProxyConfigTransport:
+    """Thread-safe ELRS Lua transport driven by crsfproxy's serial loop."""
+
+    def __init__(self) -> None:
+        self.inbound: queue.Queue[CrsfFrame] = queue.Queue()
+        self.outbound: queue.Queue[bytes] = queue.Queue()
+        self.state_lock = threading.Lock()
+        self.radio_rate_hz = None
+        self.status = None
+
+    def origin(self, device_address: int) -> int:
+        if device_address == ELRS_ADDRESS_TRANSMITTER:
+            return CRSF_ADDRESS_ELRS_LUA
+        return CRSF_ADDRESS_RADIO_TRANSMITTER
+
+    def queue(self, frame: bytes) -> None:
+        self.outbound.put(frame)
+
+    def flush(self) -> None:
+        while not self.outbound.empty():
+            time.sleep(0.001)
+
+    def poll(self) -> list[CrsfFrame]:
+        frames = []
+        while True:
+            try:
+                frames.append(self.inbound.get_nowait())
+            except queue.Empty:
+                return frames
+
+    def drain_outbound(self) -> list[bytes]:
+        frames = []
+        while True:
+            try:
+                frames.append(self.outbound.get_nowait())
+            except queue.Empty:
+                return frames
+
+    def observe(self, frame: CrsfFrame) -> None:
+        if frame.type == FrameType.RADIO_ID and len(frame.payload) >= 11 \
+                and frame.payload[2] == 0x10:
+            interval = int.from_bytes(frame.payload[3:7], "big", signed=True)
+            if interval > 0:
+                with self.state_lock:
+                    self.radio_rate_hz = 10_000_000 / interval
+        if frame.type == FrameType.ELRS_STATUS and len(frame.extended_payload) >= 4:
+            data = frame.extended_payload
+            message = data[4:].split(bytes([0]), 1)[0].decode("utf-8", errors="replace")
+            with self.state_lock:
+                self.status = {
+                    "connected": bool(data[3] & 1),
+                    "packets_bad": data[0],
+                    "packets_good": int.from_bytes(data[1:3], "big"),
+                    "flags": f"0x{data[3]:02X}",
+                    "message": message,
+                }
+        if frame.origin == ELRS_ADDRESS_TRANSMITTER and frame.type in (
+                FrameType.DEVICE_INFO,
+                FrameType.PARAMETER_SETTINGS_ENTRY,
+                FrameType.PARAMETER_WRITE,
+                FrameType.ELRS_STATUS):
+            self.inbound.put(frame)
+
+    def snapshot(self) -> dict:
+        with self.state_lock:
+            return {
+                "radio_rate_hz": self.radio_rate_hz,
+                "binding": self.status,
+            }
+
+
+class ConfigService:
+    """Execute one-shot Lua-style operations against the ELRS transmitter."""
+
+    def __init__(self, transport: ProxyConfigTransport) -> None:
+        self.transport = transport
+        self.client = ParameterClient(transport, CONFIG_PARAMETER_TIMEOUT_S)
+        self.device = None
+
+    def transmitter(self) -> DeviceInfo:
+        if self.device is None:
+            devices = self.client.discover(CONFIG_DEVICE_DISCOVERY_S)
+            self.device = devices[ELRS_ADDRESS_TRANSMITTER]
+        return self.device
+
+    def execute(self, request: dict) -> dict:
+        command = request["command"].casefold()
+        if command == "devices":
+            devices = self.client.discover(CONFIG_DEVICE_DISCOVERY_S)
+            return {"devices": [device_dict(devices[address]) for address in sorted(devices)]}
+
+        transmitter = self.transmitter()
+        if command == "params":
+            result = {
+                "device": device_dict(transmitter),
+                "parameters": [parameter_dict(parameter)
+                               for parameter in self.client.read_all(transmitter)],
+            }
+            result.update(self.transport.snapshot())
+            return result
+        if command == "info":
+            parameters = self.client.read_all(transmitter)
+            values = {
+                parameter.name: parameter_value(parameter)
+                for parameter in parameters
+                if parameter.value is not None
+            }
+            firmware_hash = None
+            for name, value in values.items():
+                if "hash" in name.casefold() or "git" in name.casefold():
+                    firmware_hash = value
+                    break
+            result = {
+                "device": device_dict(transmitter),
+                "current_band": values.get("RF Band"),
+                "packet_rate": values.get("Packet Rate"),
+                "mode": values.get("Link Mode"),
+                "model_id": values.get("Model Id"),
+                "telemetry_ratio": values.get("Telem Ratio"),
+                "firmware_hash": firmware_hash,
+                "configuration": values,
+                "lua_info": {
+                    parameter.name: parameter_value(parameter)
+                    for parameter in parameters
+                    if parameter.type in (ParameterType.INFO, ParameterType.STRING)
+                },
+            }
+            result.update(self.transport.snapshot())
+            return result
+
+        parameter = self.client.find(transmitter, str(request["parameter"]))
+        if command == "get":
+            return {"parameter": parameter_dict(parameter)}
+        if command == "set":
+            result = self.client.write(transmitter.address, parameter, str(request["value"]))
+            return {
+                "verified": result.verified,
+                "old_value": result.old_value,
+                "parameter": parameter_dict(result.parameter),
+            }
+        if command == "command":
+            result = self.client.command(
+                transmitter.address, parameter, bool(request.get("confirm", False)))
+            return {"parameter": parameter_dict(result)}
+        raise ValueError(f"unknown configuration command {request['command']!r}")
+
+
+def parse_config_request(data: bytes) -> dict:
+    text = data.decode("utf-8").strip()
+    if text.startswith("{"):
+        return json.loads(text)
+    words = shlex.split(text)
+    command = words[0].casefold()
+    if command in ("info", "devices", "params"):
+        return {"command": command}
+    if command == "get":
+        return {"command": command, "parameter": words[1]}
+    if command == "set":
+        return {"command": command, "parameter": words[1], "value": words[2]}
+    if command == "command":
+        return {
+            "command": command,
+            "parameter": words[1],
+            "confirm": "--confirm" in words[2:],
+        }
+    raise ValueError(f"unknown configuration command {words[0]!r}")
+
+
+class ConfigUdpServer(threading.Thread):
+    def __init__(self, host: str, port: int, transport: ProxyConfigTransport,
+                 debug: bool = False) -> None:
+        super().__init__(name="config-udp", daemon=True)
+        self.host = host
+        self.port = port
+        self.transport = transport
+        self.debug = debug
+        self.stop_event = threading.Event()
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket.bind((host, port))
+        self.socket.settimeout(0.1)
+
+    def run(self) -> None:
+        service = ConfigService(self.transport)
+        while not self.stop_event.is_set():
+            try:
+                data, sender = self.socket.recvfrom(CONFIG_RESPONSE_LIMIT)
+            except socket.timeout:
+                continue
+            try:
+                request = parse_config_request(data)
+            except (UnicodeDecodeError, json.JSONDecodeError, ValueError, IndexError) as error:
+                response = {"ok": False, "error": f"{type(error).__name__}: {error}"}
+            else:
+                if self.debug:
+                    print(f"Config request sender={sender} command={request.get('command')!r}")
+                try:
+                    response = {"ok": True, "result": service.execute(request)}
+                except (KeyError, ValueError, TimeoutError, RuntimeError) as error:
+                    response = {"ok": False, "error": f"{type(error).__name__}: {error}"}
+            payload = json.dumps(response, separators=(",", ":")).encode("utf-8")
+            self.socket.sendto(payload, sender)
+
+    def close(self) -> None:
+        self.stop_event.set()
+        self.join()
+        self.socket.close()
 
 class PacketsTypes(IntEnum):
     GPS = 0x02
@@ -278,6 +559,7 @@ def main():
     parser.add_argument('--failsafe_time_ms', type=int, default=1000, help="Enter failsafe after this")
     parser.add_argument('--failsafe_channels_us', nargs=CHANNEL_COUNT, type=int, default=FAILSAFE_DEFAULT_US, help="Failsafe channels in microseconds (16 values, space-separated)")
     parser.add_argument('--telemetry_udp', help="Send raw CRSF telemetry frames to udp://host:port (e.g. MWP)")
+    parser.add_argument('--config_udp', type=int, help="UDP port for TX elrs.lua configuration commands")
     parser.add_argument('--debug', action='store_true', help="Verbose RC/telemetry logging")
     args = parser.parse_args()
 
@@ -345,6 +627,15 @@ def main():
         print(f"Telemetry UDP target {tele_target}")
         if args.debug:
             print("Debug telemetry forwarding enabled")
+
+    config_transport = None
+    config_server = None
+    next_config_status_t = 0.0
+    if args.config_udp is not None:
+        config_transport = ProxyConfigTransport()
+        config_server = ConfigUdpServer(HOST, args.config_udp, config_transport, args.debug)
+        config_server.start()
+        print(f"ELRS configuration UDP listening on {HOST}:{args.config_udp}")
 
     last_rc_sender = None
     last_rc_update_t = 0.0
@@ -462,6 +753,9 @@ def main():
                         f"type=0x{frame[2]:02x} "
                         f"frame_hex={frame.hex()}"
                     )
+                if config_transport is not None:
+                    config_transport.observe(
+                        CrsfFrame(frame[0], frame[2], frame[3:-1], frame))
                 if tele_sock is not None:
                     try:
                         tele_sock.sendto(frame, tele_target)
@@ -495,6 +789,14 @@ def main():
 
             # Determine which channels to send
             if (now - last_tx_t) >= (1.0 / tx_rate):
+                if config_transport is not None and now >= next_config_status_t:
+                    config_transport.queue(make_extended_frame(
+                        FrameType.PARAMETER_WRITE,
+                        ELRS_ADDRESS_TRANSMITTER,
+                        CRSF_ADDRESS_ELRS_LUA,
+                        bytes([0, 0]),
+                    ))
+                    next_config_status_t = now + CONFIG_STATUS_INTERVAL_S
                 elapsed_ms = (now - last_rc_update_t) * 1000.0
                 if last_valid_channels_us is None:
                     active = failsafe_us
@@ -524,14 +826,18 @@ def main():
                     last_tx_debug_t = now
                 try:
                     frame = channelsUsToPacket(active)
-                    written = ser.write(frame)
+                    control_frames = config_transport.drain_outbound() \
+                        if config_transport is not None else []
+                    burst = frame + b"".join(control_frames)
+                    written = ser.write(burst)
                     if args.debug:
                         print(
-                            f"Serial tx frame_len={len(frame)} written={written} "
+                            f"Serial tx frame_len={len(frame)} control_frames={len(control_frames)} "
+                            f"burst_len={len(burst)} written={written} "
                             f"type=0x{frame[2]:02x} frame_hex={frame.hex()}"
                         )
                 except serial.SerialTimeoutException as e:
-                    print(f"Serial write timeout port={args.device} baud={args.baud} frame_len={len(frame)} elapsed_ms={elapsed_ms:.1f} err={e}")
+                    print(f"Serial write timeout port={args.device} baud={args.baud} burst_len={len(burst)} elapsed_ms={elapsed_ms:.1f} err={e}")
                 last_tx_t = now
 
             loop_elapsed = time.time() - loop_start
@@ -545,6 +851,8 @@ def main():
             rc_sock.close()
         except OSError:
             pass
+        if config_server is not None:
+            config_server.close()
         try:
             ser.close()
         except OSError:
